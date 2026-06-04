@@ -1165,6 +1165,8 @@ const S = {
 
   // Last analysis
   lastAnalysis: null,
+  pendingBet: null,
+  pendingReqId: null,
 };
 
 // ─────────────────────────────────────────────────────
@@ -1384,8 +1386,34 @@ function handleMsg(msg) {
   if(quote !== undefined) { processTick(parseFloat(quote)); return; }
   if(msg.msg_type === 'tick') { processTick(msg.tick.quote); return; }
 
+  // Proposal response — validate req_id, then buy immediately
+  if(msg.msg_type === 'proposal') {
+    // Ignore stale proposals from a previous cycle
+    if(msg.echo_req?.req_id !== S.pendingReqId) return;
+
+    if(msg.error) {
+      const errMsg = msg.error.message || 'Proposal rejected by Deriv';
+      showNotif('⚠ ' + errMsg, 'error');
+      S.waitingResult = false; S.pendingBet = null; S.pendingReqId = null;
+      document.getElementById('activeBetBanner').classList.remove('show');
+      return;
+    }
+
+    if(msg.proposal?.id && S.pendingBet && S.waitingResult) {
+      // Use ask_price from proposal as the buy price (prevents price mismatch rejection)
+      // ask_price is what Deriv will actually charge — must be >= our stake
+      const askPrice = parseFloat(msg.proposal.ask_price) || S.currentStake;
+      // buy ID must be a string per schema
+      send({ buy: String(msg.proposal.id), price: askPrice, subscribe: 1 });
+    }
+    return;
+  }
+
   if(msg.msg_type === 'buy' && msg.buy) {
-    S.openContract = msg.buy.contract_id; S.waitingResult = true;
+    S.openContract  = msg.buy.contract_id;
+    S.waitingResult = true;
+    S.pendingBet    = null;
+    S.pendingReqId  = null;
     send({ proposal_open_contract:1, contract_id: S.openContract, subscribe:1 });
     return;
   }
@@ -1510,8 +1538,8 @@ function selectBestDigitBet(freqs, signals, total) {
   if(total < 30 || signals.length === 0) return null;
   const candidates = [];
 
-  // OVER bets
-  for(let n=0; n<=8; n++) {
+  // OVER bets — barrier 1..7 only (0 and 8 rejected by Deriv; extreme payouts unreliable)
+  for(let n=1; n<=7; n++) {
     const payout = PAYOUTS.OVER[n];
     if(!payout) continue;
     let winProb = 0;
@@ -1519,8 +1547,8 @@ function selectBestDigitBet(freqs, signals, total) {
     const ev = (winProb * payout) - 1;
     candidates.push({ type:'OVER', barrier:n, payout, winProb, ev, label:`Over ${n}`, desc:`Last digit > ${n}` });
   }
-  // UNDER bets
-  for(let n=1; n<=9; n++) {
+  // UNDER bets — barrier 2..8 only (1 and 9 rejected by Deriv; extreme payouts unreliable)
+  for(let n=2; n<=8; n++) {
     const payout = PAYOUTS.UNDER[n];
     if(!payout) continue;
     let winProb = 0;
@@ -1683,19 +1711,37 @@ function executeTrade(bet) {
   document.getElementById('abbStake').textContent = '$' + S.currentStake.toFixed(2);
   document.getElementById('abbMeta').textContent = `Level ${S.martLevel} · Payout ${bet.payout}x · EV ${(bet.ev*100).toFixed(2)}%`;
 
-  const contractType = bet.type === 'OVER' ? 'DIGITOVER' : bet.type === 'UNDER' ? 'DIGITUNDER' : bet.type;
-  const params = {
-    amount: S.currentStake,
-    basis: 'stake',
-    contract_type: contractType,
-    currency: 'USD',
-    duration: 1,
-    duration_unit: 't',
-    symbol: S.index
-  };
-  if(bet.barrier !== null && bet.barrier !== undefined) params.barrier = bet.barrier.toString();
+  // Normalise contract type to Deriv enum
+  const contractType =
+    bet.type === 'OVER'  ? 'DIGITOVER'  :
+    bet.type === 'UNDER' ? 'DIGITUNDER' :
+    bet.type === 'CALL'  ? 'CALL'       : 'PUT';
 
-  send({ buy:1, price: S.currentStake, parameters: params });
+  // Unique req_id so we can match this proposal response and ignore stale ones
+  const reqId = Date.now() % 1000000; // stays within safe integer range
+  S.pendingReqId = reqId;
+  S.pendingBet   = bet;
+
+  // Proposal request — uses 'underlying_symbol' (not 'symbol') per schema
+  // Do NOT include subscribe:1 — digit/tick contracts don't stream prices
+  const proposalReq = {
+    proposal:          1,
+    req_id:            reqId,
+    amount:            S.currentStake,
+    basis:             'stake',
+    contract_type:     contractType,
+    currency:          'USD',
+    duration:          1,
+    duration_unit:     't',
+    underlying_symbol: S.index
+  };
+
+  // Barrier must be a string matching /^[+-]?[0-9]+\.?[0-9]*$/
+  if(bet.barrier !== null && bet.barrier !== undefined) {
+    proposalReq.barrier = String(bet.barrier);
+  }
+
+  send(proposalReq);
 }
 
 // ─────────────────────────────────────────────────────
