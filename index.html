@@ -1178,7 +1178,8 @@ const S = {
 
 const DERIV_APP_ID    = '336QP1kNMSfXnnbOgZK2X';
 const REDIRECT_URI    = 'https://rauyamelkzedeck-wq.github.io/MangiNexus/';
-const DERIV_OAUTH_URL = 'https://oauth.deriv.com/oauth2/authorize';
+const DERIV_AUTH_URL  = 'https://auth.deriv.com/oauth2/auth';
+const WORKER_URL      = 'https://manginexus-auth.rauyamelkzedeck.workers.dev/';
 const API_BASE        = 'https://api.derivws.com';
 
 let selectedAccType = 'demo';
@@ -1189,61 +1190,106 @@ function selectAccType(type) {
   document.getElementById('tab-real').classList.toggle('active', type === 'real');
 }
 
-// Step 1: Redirect user to Deriv OAuth login
-function startOAuth() {
+// ── PKCE helpers
+async function generatePKCE() {
+  const array = crypto.getRandomValues(new Uint8Array(64));
+  const verifier = Array.from(array)
+    .map(v => 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~'[v % 66])
+    .join('');
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+  const challenge = btoa(String.fromCharCode(...new Uint8Array(hash)))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  return { verifier, challenge };
+}
+
+function generateState() {
+  return crypto.getRandomValues(new Uint8Array(16))
+    .reduce((s, b) => s + b.toString(16).padStart(2, '0'), '');
+}
+
+// Step 1: Redirect user to Deriv login with PKCE
+async function startOAuth() {
   const btn = document.getElementById('ccOAuthBtn');
   btn.disabled = true;
-  sessionStorage.setItem('mn_acc_type', selectedAccType);
-  const state = Math.random().toString(36).slice(2);
-  sessionStorage.setItem('mn_oauth_state', state);
+  document.getElementById('ccStatus').textContent = 'Preparing secure login...';
+
+  const { verifier, challenge } = await generatePKCE();
+  const state = generateState();
+
+  // Store before redirect — survives page unload, cleared on tab close
+  sessionStorage.setItem('mn_pkce_verifier', verifier);
+  sessionStorage.setItem('mn_oauth_state',   state);
+  sessionStorage.setItem('mn_acc_type',      selectedAccType);
+
   const params = new URLSearchParams({
-    app_id:        DERIV_APP_ID,
-    redirect_uri:  REDIRECT_URI,
-    response_type: 'code',
-    scope:         'read trade',
-    state:         state
+    response_type:          'code',
+    client_id:              DERIV_APP_ID,
+    redirect_uri:           REDIRECT_URI,
+    scope:                  'trade account_manage',
+    state:                  state,
+    code_challenge:         challenge,
+    code_challenge_method:  'S256',
   });
-  window.location.href = `${DERIV_OAUTH_URL}?${params.toString()}`;
+
+  window.location.href = `${DERIV_AUTH_URL}?${params.toString()}`;
 }
 
 // Step 2: On page load, detect OAuth callback
 async function checkOAuthCallback() {
-  const params = new URLSearchParams(window.location.search);
-  const code   = params.get('code');
-  const error  = params.get('error');
+  const params   = new URLSearchParams(window.location.search);
+  const code     = params.get('code');
+  const retState = params.get('state');
+  const error    = params.get('error');
 
   if(error) {
     document.getElementById('ccStatus').textContent = '❌ Login cancelled. Please try again.';
     cleanUrl(); return;
   }
-  if(!code) return; // Normal page load — show login
+  if(!code) return; // Normal load — show login screen
 
-  // OAuth callback — show processing screen
+  // Show processing screen
   document.getElementById('ccLoginForm').style.display  = 'none';
   document.getElementById('ccProcessing').style.display = 'block';
   cleanUrl();
 
+  // Verify state (CSRF protection)
+  const savedState    = sessionStorage.getItem('mn_oauth_state');
+  const codeVerifier  = sessionStorage.getItem('mn_pkce_verifier');
+  const accType       = sessionStorage.getItem('mn_acc_type') || 'demo';
+
+  // Clear sensitive values immediately
+  sessionStorage.removeItem('mn_pkce_verifier');
+  sessionStorage.removeItem('mn_oauth_state');
+
+  if(retState !== savedState) {
+    showOAuthError('State mismatch — possible CSRF attack. Please try again.');
+    return;
+  }
+
+  if(!codeVerifier) {
+    showOAuthError('Session expired. Please try logging in again.');
+    return;
+  }
+
   S.appId = DERIV_APP_ID;
-  const accType = sessionStorage.getItem('mn_acc_type') || 'demo';
 
   try {
-    // Try token exchange endpoint first
-    setProcSub('Step 1/3: Authenticating with Deriv...');
-    let token = null;
+    setProcSub('Step 1/3: Exchanging code via secure relay...');
 
-    const tokenRes = await fetch(`${API_BASE}/oauth2/token`, {
-      method: 'POST',
-      headers: { 'Content-Type':'application/json', 'Deriv-App-ID': DERIV_APP_ID },
-      body: JSON.stringify({ code, redirect_uri: REDIRECT_URI, grant_type: 'authorization_code' })
-    }).catch(() => null);
+    // Send code + verifier to our Cloudflare Worker (server-side exchange)
+    const workerRes = await fetch(WORKER_URL, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ code, code_verifier: codeVerifier })
+    });
 
-    if(tokenRes && tokenRes.ok) {
-      const td = await tokenRes.json();
-      token = td?.access_token || td?.data?.access_token;
+    const workerData = await workerRes.json();
+
+    if(!workerRes.ok || !workerData.access_token) {
+      throw new Error(workerData.error || workerData.detail?.error_description || 'Token exchange failed');
     }
 
-    // Fallback: use code directly as bearer (Deriv sometimes issues tokens directly)
-    S.token = token || code;
+    S.token = workerData.access_token;
     await initializeAccount(accType);
 
   } catch(err) {
