@@ -753,11 +753,11 @@ canvas { display:block; width:100%; }
       </div>
       <div class="ctrl-item">
         <div class="ctrl-lbl">Profit Target $</div>
-        <input class="ctrl-input" type="number" id="ctrlPT" value="10" min="1">
+        <input class="ctrl-input" type="number" id="ctrlPT" value="5000" min="1">
       </div>
       <div class="ctrl-item">
         <div class="ctrl-lbl">Stop Loss $</div>
-        <input class="ctrl-input" type="number" id="ctrlSL" value="20" min="1">
+        <input class="ctrl-input" type="number" id="ctrlSL" value="2000" min="1">
       </div>
     </div>
     <div class="sl-banner" id="slBanner">Session stopped — limit reached.<br>Review results before restarting.</div>
@@ -1592,22 +1592,24 @@ function decideAndTrade(analysis) {
 
   const tier = TIERS[S.tier];
 
-  // CHECK SESSION LIMITS
-  const sessionPnl = S.balance - S.dayStart;
-  const ptDollar = parseFloat(document.getElementById('ctrlPT').value);
-  const slDollar = parseFloat(document.getElementById('ctrlSL').value);
+  // CHECK SESSION LIMITS — use cumulative session P&L (S.totalPnl)
+  // This tracks net profit/loss since last reset, independent of balance changes
+  const ptDollar = parseFloat(document.getElementById('ctrlPT').value) || 5000;
+  const slDollar = parseFloat(document.getElementById('ctrlSL').value) || 2000;
 
-  if(sessionPnl >= ptDollar) {
+  if(S.totalPnl >= ptDollar) {
     stopBot();
-    showNotif(`✅ Profit target $${ptDollar} hit`, 'success');
-    document.getElementById('slBanner').textContent = `Profit target $${ptDollar.toFixed(2)} reached. Reset to start a new session.`;
+    showNotif(`✅ Profit target $${ptDollar.toFixed(0)} reached — bot stopped`, 'success');
+    document.getElementById('slBanner').textContent =
+      `🎯 Profit target $${ptDollar.toFixed(0)} reached. Session P&L: +$${S.totalPnl.toFixed(2)}. Reset to start a new session.`;
     document.getElementById('slBanner').classList.add('show');
     return;
   }
-  if(sessionPnl <= -slDollar) {
+  if(S.totalPnl <= -slDollar) {
     stopBot();
-    showNotif(`⛔ Stop loss $${slDollar} hit`, 'error');
-    document.getElementById('slBanner').textContent = `Stop loss $${slDollar.toFixed(2)} triggered. Review results before restarting.`;
+    showNotif(`⛔ Stop loss $${slDollar.toFixed(0)} hit — bot stopped`, 'error');
+    document.getElementById('slBanner').textContent =
+      `🛑 Stop loss $${slDollar.toFixed(0)} triggered. Session P&L: -$${Math.abs(S.totalPnl).toFixed(2)}. Review before restarting.`;
     document.getElementById('slBanner').classList.add('show');
     return;
   }
@@ -2088,8 +2090,8 @@ function updateBalance() {
 }
 
 function updateGauges() {
-  const sl = parseFloat(document.getElementById('ctrlSL').value) || 20;
-  const pt = parseFloat(document.getElementById('ctrlPT').value) || 10;
+  const sl = parseFloat(document.getElementById('ctrlSL').value) || 2000;
+  const pt = parseFloat(document.getElementById('ctrlPT').value) || 5000;
   const dailyLoss   = Math.max(0, S.dayStart - S.balance);
   const dailyProfit = Math.max(0, S.balance - S.dayStart);
   const tier = TIERS[S.tier];
