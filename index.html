@@ -1083,7 +1083,18 @@ canvas { display:block; width:100%; }
 
       <div class="trade-log-header">
         <div class="tl-title">// Trade History</div>
-        <div class="tl-count" id="tlCount">0 trades</div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <div class="tl-count" id="tlCount">0 trades</div>
+          <button id="btnExport" onclick="exportCSV()" disabled style="
+            font-family:var(--font-m);font-size:8px;letter-spacing:2px;
+            background:transparent;border:1px solid var(--border2);color:var(--text2);
+            border-radius:4px;padding:3px 8px;cursor:pointer;transition:all .2s;
+            text-transform:uppercase;
+          " onmouseover="if(!this.disabled)this.style.borderColor='var(--gold)',this.style.color='var(--gold)'"
+             onmouseout="if(!this.disabled)this.style.borderColor='var(--border2)',this.style.color='var(--text2)'">
+            ↓ CSV
+          </button>
+        </div>
       </div>
       <div class="trade-log" id="tradeLog">
         <div style="padding:20px;text-align:center;font-family:var(--font-m);font-size:10px;color:var(--text2)">
@@ -2181,9 +2192,30 @@ function addToLog(win, profit, type, barrier) {
   if(empty) empty.remove();
 
   const tot = S.wins + S.losses;
+  const now = new Date();
+
+  // Store full trade record for CSV export
+  S.trades.push({
+    trade_no:     tot,
+    timestamp:    now.toISOString(),
+    time_gmt:     now.toTimeString().slice(0,8),
+    result:       win ? 'WIN' : 'LOSS',
+    strategy:     S.strategy.toUpperCase(),
+    index:        S.index,
+    contract_type: type,
+    barrier:      barrier ?? '',
+    stake:        S.currentStake,
+    profit:       profit,
+    mart_level:   S.martLevel,
+    session_pnl:  S.totalPnl,
+    chi2:         S.lastAnalysis ? parseFloat(S.lastAnalysis.chi.toFixed(2)) : 0,
+    signal:       S.lastAnalysis ? S.lastAnalysis.sigStrength : 'unknown',
+    risk_tier:    S.tier,
+  });
+
+  const label = barrier ? (type === 'OVER' ? `Over ${barrier}` : `Under ${barrier}`) : type;
   const el = document.createElement('div');
   el.className = `trade-entry ${win?'win':'loss'}`;
-  const label = barrier ? (type === 'OVER' ? `Over ${barrier}` : `Under ${barrier}`) : type;
   el.innerHTML = `
     <div class="te-top">
       <span class="te-type" style="color:${win?'var(--green)':'var(--red)'}">
@@ -2194,11 +2226,12 @@ function addToLog(win, profit, type, barrier) {
       </span>
     </div>
     <div class="te-meta">
-      Stake $${S.currentStake.toFixed(2)} · Level ${S.martLevel} · ${new Date().toTimeString().slice(0,8)} · #${tot}
+      Stake $${S.currentStake.toFixed(2)} · Level ${S.martLevel} · ${now.toTimeString().slice(0,8)} · #${tot}
     </div>`;
   log.insertBefore(el, log.firstChild);
   document.getElementById('tlCount').textContent = tot + ' trades';
   while(log.children.length > 100) log.removeChild(log.lastChild);
+  document.getElementById('btnExport').disabled = false;
 }
 
 // ─────────────────────────────────────────────────────
@@ -2452,6 +2485,79 @@ function initUI() {
   renderLadder();
   updateTierSummary();
   setRiskTier('medium');
+}
+
+// ─────────────────────────────────────────────────────
+// CSV EXPORT
+// ─────────────────────────────────────────────────────
+function exportCSV() {
+  if(!S.trades.length) return;
+
+  const headers = [
+    'Trade #','Timestamp','Time (GMT)','Result','Strategy','Index',
+    'Contract Type','Barrier','Stake ($)','Profit ($)',
+    'Martingale Level','Session P&L ($)','Chi² Score','Signal Strength','Risk Tier'
+  ];
+
+  const rows = S.trades.map(t => [
+    t.trade_no,
+    t.timestamp,
+    t.time_gmt,
+    t.result,
+    t.strategy,
+    t.index,
+    t.contract_type,
+    t.barrier,
+    t.stake.toFixed(2),
+    t.profit.toFixed(4),
+    t.mart_level,
+    t.session_pnl.toFixed(4),
+    t.chi2,
+    t.signal,
+    t.risk_tier,
+  ]);
+
+  // Build CSV string
+  const csv = [headers, ...rows]
+    .map(r => r.map(v => `"${String(v).replace(/"/g,'""')}"`).join(','))
+    .join('\n');
+
+  // Summary block appended below trades
+  const tot   = S.wins + S.losses;
+  const wr    = tot > 0 ? (S.wins/tot*100).toFixed(1) : '0';
+  const pf    = S.totalLossAmt > 0 ? (S.totalWinAmt/S.totalLossAmt).toFixed(3) : 'N/A';
+  const exp   = tot > 0 ? (S.totalPnl/tot).toFixed(4) : '0';
+  const summary = [
+    '',
+    '"SUMMARY"',
+    `"Total Trades","${tot}"`,
+    `"Wins","${S.wins}"`,
+    `"Losses","${S.losses}"`,
+    `"Win Rate","${wr}%"`,
+    `"Profit Factor","${pf}"`,
+    `"Expectancy per Trade","$${exp}"`,
+    `"Session P&L","$${S.totalPnl.toFixed(2)}"`,
+    `"Max Drawdown","$${S.maxDrawdown.toFixed(2)}"`,
+    `"Signals Skipped (gate)","${S.skippedSignals}"`,
+    `"Gate: Escalated","${S.gateStats.escalated}"`,
+    `"Gate: Held","${S.gateStats.held}"`,
+    `"Gate: Sat Out","${S.gateStats.sittingOut}"`,
+    `"Gate: Recovered","${S.gateStats.recovered}"`,
+    `"Risk Tier","${TIERS[S.tier].name}"`,
+    `"Strategy","${S.strategy.toUpperCase()}"`,
+    `"Index","${S.index}"`,
+    `"Export Time","${new Date().toISOString()}"`,
+  ].join('\n');
+
+  const blob = new Blob([csv + '\n' + summary], { type: 'text/csv' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href     = url;
+  a.download = `MangiNexus_trades_${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+
+  showNotif(`Exported ${S.trades.length} trades`, 'success');
 }
 
 // Run clock
