@@ -1184,14 +1184,13 @@ const GOOD_UNDER_BARRIERS = [3, 4, 5];
 
 // ── RISK TIERS
 const TIERS = {
-  // Data shows L0 earns ~+$15k, all martingale levels destroy value.
-  // Multipliers slashed to 1.2x max. Escalation requires BOTH cooldown AND strong signal.
-  // Low risk: flat stake only (maxLevels:0 = no martingale)
-  // Medium:   1 recovery level max, 1.2x, 5 tick cooldown before any escalation
-  // High:     2 levels max, 1.3x, 3 tick cooldown
-  low:    { stakePct:0.005, mult:1.0, maxLevels:0,  minChi:16.92, moderateChi:11.07, slPct:0.03,  ptPct:0.05,  pauseTicks:8,  cooldownTicks:8,  name:'LOW' },
-  medium: { stakePct:0.01,  mult:1.2, maxLevels:2,  minChi:16.92, moderateChi:11.07, slPct:0.08,  ptPct:0.12,  pauseTicks:5,  cooldownTicks:5,  name:'MEDIUM' },
-  high:   { stakePct:0.02,  mult:1.3, maxLevels:3,  minChi:11.07, moderateChi:7.00,  slPct:0.20,  ptPct:0.25,  pauseTicks:3,  cooldownTicks:3,  name:'HIGH' }
+  // Data (4000+ trades): martingale at ALL levels destroys edge.
+  // L0 net -$319, L1 net -$525. Flat stake only until base edge confirmed >+$0.30/trade.
+  // All tiers: maxLevels:0 = pure flat stake. mult irrelevant.
+  // Streak circuit breaker: pauseTicks after 5 consecutive losses.
+  low:    { stakePct:0.005, mult:1.0, maxLevels:0, minChi:16.92, moderateChi:11.07, slPct:0.03, ptPct:0.05, pauseTicks:20, cooldownTicks:20, streakBreaker:5, name:'LOW'    },
+  medium: { stakePct:0.01,  mult:1.0, maxLevels:0, minChi:16.92, moderateChi:11.07, slPct:0.08, ptPct:0.12, pauseTicks:15, cooldownTicks:15, streakBreaker:5, name:'MEDIUM' },
+  high:   { stakePct:0.02,  mult:1.0, maxLevels:0, minChi:11.07, moderateChi:7.00,  slPct:0.20, ptPct:0.25, pauseTicks:10, cooldownTicks:10, streakBreaker:4, name:'HIGH'   },
 };
 
 // ── GLOBAL STATE
@@ -1245,16 +1244,15 @@ const S = {
   optimiser: {
     enabled:      false,
     phase:        'explore',   // 'explore' | 'exploit'
-    blockSize:    50,          // trades per evaluation block
+    blockSize:    20,          // trades per evaluation block (reduced: 50 was too slow)
     minBlocks:    3,           // blocks needed before locking a combo
-    lockBlocks:   3,           // blocks to run locked combo before re-exploring
-    combos: [                  // all combinations to evaluate
-      { index:'1HZ100V', strategy:'rise',  label:'V100 1s · Rise/Fall' },
-      { index:'1HZ75V',  strategy:'rise',  label:'V75 1s  · Rise/Fall' },
-      { index:'1HZ50V',  strategy:'rise',  label:'V50 1s  · Rise/Fall' },
-      { index:'1HZ100V', strategy:'digit', label:'V100 1s · Digit'     },
-      { index:'1HZ75V',  strategy:'digit', label:'V75 1s  · Digit'     },
-      { index:'1HZ50V',  strategy:'digit', label:'V50 1s  · Digit'     },
+    lockBlocks:   5,           // blocks (100 trades) to run locked combo before re-exploring
+    combos: [
+      // DIGIT removed — 4,000+ trades proves structural loser on all indices
+      // Rise/Fall only: confirmed +$0.506 exp/trade on V100 1s over 1,336 trades
+      { index:'1HZ100V', strategy:'rise', label:'V100 1s · Rise/Fall' },
+      { index:'1HZ75V',  strategy:'rise', label:'V75 1s  · Rise/Fall' },
+      { index:'1HZ50V',  strategy:'rise', label:'V50 1s  · Rise/Fall' },
     ],
     stats:        {},          // key: 'index|strategy' → { trades, wins, winAmt, lossAmt, blocks }
     currentCombo: 0,           // index into combos[]
@@ -1785,8 +1783,16 @@ function decideAndTrade(analysis) {
 
   const tier = TIERS[S.tier];
 
+  // ── STREAK CIRCUIT BREAKER
+  // Data: 116 streaks >3 losses, 22 streaks of 6+. Pause after N consecutive losses.
+  if(S.curLossStreak >= tier.streakBreaker && S.pauseTicks === 0) {
+    S.pauseTicks = tier.pauseTicks;
+    document.getElementById('pauseBadge').classList.add('show');
+    showNotif(`⚡ ${S.curLossStreak} loss streak — pausing ${tier.pauseTicks} ticks`, 'warn');
+    return;
+  }
+
   // CHECK SESSION LIMITS — use cumulative session P&L (S.totalPnl)
-  // This tracks net profit/loss since last reset, independent of balance changes
   const ptDollar = parseFloat(document.getElementById('ctrlPT').value) || 5000;
   const slDollar = parseFloat(document.getElementById('ctrlSL').value) || 2000;
 
@@ -1807,77 +1813,20 @@ function decideAndTrade(analysis) {
     return;
   }
 
-  // ── SIGNAL-GATED MARTINGALE (v4 — cooldown-enforced architecture)
-  // Data shows: L0 is profitable, L1+ destroy value when escalated immediately.
-  // Root cause: chi² stays high even after loss (window didn't fully reset).
-  // Fix: enforce mandatory cooldown ticks BEFORE any escalation decision.
-  // During cooldown: trade at BASE stake only — preserve edge, skip recovery attempt.
-  // After cooldown: only escalate if signal is strong AND loss was single (not a streak).
+  // ── FLAT STAKE ONLY (data: all martingale levels destroy edge)
+  // Simple gate: only skip if EV is negative. Otherwise always trade at base stake.
+  S.currentStake = S.baseStake;
+  S.martLevel = 0;
 
-  if(S.recoveryPendingLevel > 0) {
-    S.recoveryTicks++;
-    const cooled = S.recoveryTicks >= tier.cooldownTicks;
-
-    if(!cooled) {
-      // Mandatory sit-out cooldown — trade at base stake regardless of signal
-      S.currentStake = S.baseStake;
-      S.skippedSignals++;
-      document.getElementById('pvSkipped').textContent = S.skippedSignals;
-      S.gateStats.sittingOut++;
-      updateMartDecision('sit_out', analysis);
-      // Still allow a BASE trade during cooldown — just at base stake
-      // (don't return — fall through to executeTrade at baseStake)
-    } else {
-      // Cooldown complete — now evaluate signal quality for escalation
-      const decision = signalGate(analysis, tier);
-      updateMartDecision(decision, analysis);
-
-      if(decision === 'escalate') {
-        // Strong signal after cooldown — escalate
-        S.martLevel = Math.min(S.recoveryPendingLevel, tier.maxLevels);
-        S.currentStake = +(S.baseStake * Math.pow(tier.mult, S.martLevel)).toFixed(2);
-        S.recoveryPendingLevel = 0;
-        S.recoveryTicks = 0;
-        S.gateStats.escalated++;
-      } else if(decision === 'hold') {
-        // Moderate signal — trade at base, extend wait one more cycle
-        S.currentStake = S.baseStake;
-        S.gateStats.held++;
-        if(S.recoveryTicks >= tier.cooldownTicks * 3) {
-          // Too long — abandon recovery entirely
-          S.martLevel = 0; S.streakLoss = 0;
-          S.currentStake = S.baseStake;
-          S.recoveryPendingLevel = 0; S.recoveryTicks = 0;
-          showNotif('Recovery abandoned — back to base stake', 'info');
-          renderLadder();
-        }
-      } else {
-        // Weak signal after cooldown — abandon recovery, reset to base
-        S.martLevel = 0; S.streakLoss = 0;
-        S.currentStake = S.baseStake;
-        S.recoveryPendingLevel = 0; S.recoveryTicks = 0;
-        S.gateStats.sittingOut++;
-        showNotif('Weak signal — recovery abandoned, base stake restored', 'info');
-        renderLadder();
-        return; // don't trade on weak signal
-      }
-    }
-
-  } else if(S.martLevel > 0) {
-    const decision = signalGate(analysis, tier);
-    updateMartDecision(decision, analysis);
-    if(decision === 'sit_out') {
-      S.skippedSignals++;
-      document.getElementById('pvSkipped').textContent = S.skippedSignals;
-      S.gateStats.sittingOut++;
-      return;
-    }
-    if(decision === 'hold') { S.gateStats.held++; }
-    if(decision === 'escalate') { S.gateStats.escalated++; }
-
-  } else {
-    updateMartDecision('base', analysis);
+  const bet = analysis?.bestBet;
+  if(!bet || bet.ev <= 0) {
+    S.skippedSignals++;
+    document.getElementById('pvSkipped').textContent = S.skippedSignals;
+    S.gateStats.sittingOut++;
+    updateMartDecision('sit_out', analysis);
+    return;
   }
+  updateMartDecision('base', analysis);
 
   // ── Minimum tick gap between trades: prevents firing on every single tick
   // Gives the signal window time to refresh with new data
@@ -2131,7 +2080,7 @@ function optLoadStats() {
 
 function optGetExpectancy(combo) {
   const d = S.optimiser.stats[optKey(combo)];
-  if(!d || d.trades < 20) return null; // need min 20 trades for meaningful estimate
+  if(!d || d.trades < 15) return null; // need min 15 trades to score (3/4 of block)
   const avgW = d.wins   > 0 ? d.winAmt  / d.wins   : 0;
   const avgL = (d.trades - d.wins) > 0 ? d.lossAmt / (d.trades - d.wins) : 0;
   const wr   = d.wins / d.trades;
