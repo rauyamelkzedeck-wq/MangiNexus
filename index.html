@@ -1186,6 +1186,8 @@ const S = {
   pendingBet: null,
   pendingReqId: null,
   lastTradeTime: 0,
+  recoveryPendingLevel: 0,
+  recoveryTicks: 0,
 };
 
 // ─────────────────────────────────────────────────────
@@ -1685,41 +1687,73 @@ function decideAndTrade(analysis) {
     return;
   }
 
-  // ── SIGNAL GATE
-  // After a loss, processLoss() already incremented martLevel and set the escalated stake.
-  // The gate now decides what to do with that increment:
-  //   escalate → confirm the higher stake, trade it
-  //   hold     → trade but step back down one level (don't escalate further)
-  //   sit_out  → skip this tick entirely, wait for better signal
-  if(S.martLevel > 0) {
+  // ── SIGNAL-GATED MARTINGALE (v3 — recovery-pending architecture)
+  // After a loss, we enter recovery-pending state.
+  // We wait for the signal to recover to STRONG before escalating stake.
+  // If signal recovers: escalate to pending level.
+  // If signal is moderate: trade at current base level (don't escalate).
+  // If signal is weak OR N ticks pass without recovery: reset to base.
+  const MAX_RECOVERY_TICKS = 8; // ticks to wait for signal before giving up
+
+  if(S.recoveryPendingLevel > 0) {
+    S.recoveryTicks++;
     const decision = signalGate(analysis, tier);
     updateMartDecision(decision, analysis);
 
     if(decision === 'sit_out') {
-      // Signal too weak — sit out, keep current level for next tick
+      // Weak signal — don't trade, keep waiting
+      S.skippedSignals++;
+      document.getElementById('pvSkipped').textContent = S.skippedSignals;
+      S.gateStats.sittingOut++;
+
+      if(S.recoveryTicks >= MAX_RECOVERY_TICKS) {
+        // Signal never recovered — reset to base, abandon recovery
+        const lostRecovery = S.streakLoss;
+        S.martLevel = 0;
+        S.currentStake = S.baseStake;
+        S.recoveryPendingLevel = 0;
+        S.recoveryTicks = 0;
+        S.streakLoss = 0;
+        showNotif(`⚡ Signal failed to recover — reset to base (abandoned $${lostRecovery.toFixed(2)} recovery)`, 'warn');
+        updateMartDecision('base', analysis);
+        renderLadder();
+      }
+      return;
+    }
+
+    if(decision === 'escalate') {
+      // Strong signal — escalate to the pending level NOW
+      S.martLevel = S.recoveryPendingLevel;
+      S.currentStake = +(S.baseStake * Math.pow(tier.mult, S.martLevel)).toFixed(2);
+      S.recoveryPendingLevel = 0;
+      S.recoveryTicks = 0;
+      S.gateStats.escalated++;
+    }
+
+    if(decision === 'hold') {
+      // Moderate signal — trade at current (not escalated) level, keep waiting for strong
+      // Don't clear recoveryPendingLevel — still hope signal gets stronger
+      S.currentStake = S.martLevel === 0
+        ? S.baseStake
+        : +(S.baseStake * Math.pow(tier.mult, S.martLevel)).toFixed(2);
+      S.gateStats.held++;
+    }
+
+  } else if(S.martLevel > 0) {
+    // Active martingale level — check if we should continue or step down
+    const decision = signalGate(analysis, tier);
+    updateMartDecision(decision, analysis);
+    if(decision === 'sit_out') {
       S.skippedSignals++;
       document.getElementById('pvSkipped').textContent = S.skippedSignals;
       S.gateStats.sittingOut++;
       return;
     }
-
-    if(decision === 'hold') {
-      // Moderate signal — step back one level, trade at lower stake
-      const holdLevel = Math.max(0, S.martLevel - 1);
-      S.currentStake  = holdLevel === 0
-        ? S.baseStake
-        : +(S.baseStake * Math.pow(tier.mult, holdLevel)).toFixed(2);
-      S.gateStats.held++;
-    }
-
-    if(decision === 'escalate') {
-      // Strong signal — confirm the escalated level and stake set by processLoss
-      S.gateStats.escalated++;
-    }
+    if(decision === 'hold') { S.gateStats.held++; }
+    if(decision === 'escalate') { S.gateStats.escalated++; }
 
   } else {
-    // Base level — only require a bet exists (selectBestDigitBet already filters by EV)
-    // chi < 3 check was blocking all trades and preventing processLoss from ever firing
+    // Base level — just trade if bet exists
     updateMartDecision('base', analysis);
   }
 
@@ -1896,24 +1930,26 @@ function processWin(profit) {
 }
 
 function processLoss(lossAmt) {
-  S.streakLoss   += lossAmt;
-  S.lastLossAmt   = lossAmt;
-  // Increment martLevel after every loss so the gate condition triggers next tick.
-  // The gate then decides: escalate stake, hold current, or sit out.
-  // Without this increment, S.martLevel stays 0 forever and gate never fires.
+  S.streakLoss  += lossAmt;
+  S.lastLossAmt  = lossAmt;
   const tier = TIERS[S.tier];
-  if(S.martLevel < tier.maxLevels) {
-    S.martLevel++;
-    // Pre-set stake for the escalated level — gate may override this to 'hold' or 'sit_out'
-    S.currentStake = +(S.baseStake * Math.pow(tier.mult, S.martLevel)).toFixed(2);
-  } else {
-    // Already at max — hard reset, gate will handle extended pause
+
+  if(S.martLevel >= tier.maxLevels) {
+    // Already at max — hard reset
     S.martLevel    = 0;
     S.streakLoss   = 0;
     S.currentStake = S.baseStake;
+    S.recoveryPendingLevel = 0;
+    S.recoveryTicks = 0;
     S.pauseTicks   = tier.pauseTicks * 3;
     document.getElementById('pauseBadge').classList.add('show');
-    showNotif(`⚠ Max martingale level hit — resetting`, 'warn');
+    showNotif(`⚠ Max level hit — full reset`, 'warn');
+  } else {
+    // Record what level we WOULD escalate to — but don't do it yet.
+    // The gate will confirm or reject escalation based on next signal quality.
+    S.recoveryPendingLevel = S.martLevel + 1;
+    S.recoveryTicks = 0; // start counting ticks to wait for signal recovery
+    // Keep current stake unchanged until gate decides
   }
   renderLadder();
 }
@@ -1974,7 +2010,7 @@ function resetSession() {
   S.martLevel=0; S.streakLoss=0; S.lastLossAmt=0;
   S.skippedSignals=0; S.pauseTicks=0;
   S.gateStats = { escalated:0, held:0, sittingOut:0, recovered:0 };
-  S.waitingResult=false; S.openContract=null; S.lastTradeTime=0;
+  S.waitingResult=false; S.openContract=null; S.lastTradeTime=0; S.recoveryPendingLevel=0; S.recoveryTicks=0;
   S.heatmapWindows=[];
   S.dayStart = S.balance;
   S.peakBalance = S.balance;
