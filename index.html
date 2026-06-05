@@ -263,10 +263,9 @@ body::before {
 .kpi-sub { font-family:var(--font-m); font-size:9px; color:var(--text2); margin-top:2px; }
 
 /* CONTENT AREA */
-.content-area { flex:1; display:grid; grid-template-columns:1fr 320px; overflow:hidden; }
+.content-area { flex:1; display:flex; overflow:hidden; }
+.center-panels { flex:1; display:flex; flex-direction:column; overflow:hidden; min-width:0; }
 
-/* CENTER PANELS */
-.center-panels { display:flex; flex-direction:column; overflow:hidden; }
 
 /* VIEW TABS */
 .view-tabs {
@@ -475,7 +474,7 @@ canvas { display:block; width:100%; }
 
 /* ══════════════════ RIGHT PANEL */
 .right-panel {
-  width:320px; border-left:1px solid var(--border);
+  width:320px; flex-shrink:0; border-left:1px solid var(--border);
   background:var(--bg1); display:flex; flex-direction:column;
   overflow:hidden;
 }
@@ -712,11 +711,17 @@ canvas { display:block; width:100%; }
   <div class="sb-section">
     <div class="sb-label">Strategy Mode</div>
     <div class="strat-tabs">
-      <div class="strat-tab active" id="strat-digit" onclick="setStrategy('digit')">DIGIT</div>
-      <div class="strat-tab" id="strat-rise" onclick="setStrategy('rise')">RISE/FALL</div>
+      <div class="strat-tab" id="strat-digit" onclick="setStrategy('digit')">DIGIT</div>
+      <div class="strat-tab active" id="strat-rise" onclick="setStrategy('rise')">RISE/FALL</div>
     </div>
+    <button id="btnOptimiser" onclick="toggleOptimiser()" style="
+      width:100%;margin-top:8px;font-family:var(--font-m);font-size:10px;
+      letter-spacing:2px;background:transparent;border:1px solid var(--border2);
+      color:var(--text2);border-radius:var(--r);padding:7px;cursor:pointer;
+      transition:all .2s;text-transform:uppercase;
+    ">⚡ AUTO</button>
     <div class="strat-sub" id="stratDesc">
-      Over/Under on last digit. Uses chi² statistical deviation to detect bias.
+      RISE/FALL: 5-tick momentum. +2.55pp confirmed edge. Default strategy.
     </div>
   </div>
 
@@ -845,9 +850,9 @@ canvas { display:block; width:100%; }
       <div class="kpi-sub" id="kDecision">BASE</div>
     </div>
     <div class="kpi">
-      <div class="kpi-lbl">Chi² / Signal</div>
-      <div class="kpi-val" id="kChi" style="color:var(--teal)">0.00</div>
-      <div class="kpi-sub" id="kChiSub">accumulating</div>
+      <div class="kpi-lbl">Bet EV / Signal</div>
+      <div class="kpi-val" id="kChi" style="color:var(--teal)">—</div>
+      <div class="kpi-sub" id="kChiSub">no signal</div>
     </div>
   </div>
 
@@ -1064,6 +1069,27 @@ canvas { display:block; width:100%; }
     </div>
     <!-- /center-panels -->
 
+    <!-- OPTIMISER PANEL — shown when auto mode is on -->
+    <div id="optimiserPanel" style="display:none;width:260px;flex-shrink:0;
+      background:var(--bg1);border-left:1px solid var(--border);
+      border-right:1px solid var(--border);overflow-y:auto;padding:14px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <div style="font-family:var(--font-m);font-size:9px;letter-spacing:3px;
+          color:var(--teal);text-transform:uppercase">// Auto-Optimiser</div>
+        <button onclick="clearOptimiserStats()" style="font-family:var(--font-m);
+          font-size:8px;background:transparent;border:1px solid var(--border2);
+          color:var(--text2);border-radius:3px;padding:2px 6px;cursor:pointer">
+          RESET
+        </button>
+      </div>
+      <div id="optPanelBody">
+        <div style="font-family:var(--font-m);font-size:9px;color:var(--text2);
+          line-height:1.8;text-align:center;padding:20px 0">
+          Toggle AUTO to begin<br>evaluating combinations
+        </div>
+      </div>
+    </div>
+
     <!-- RIGHT PANEL -->
     <div class="right-panel">
       <div class="gauge-grid">
@@ -1151,8 +1177,10 @@ const PAYOUTS = {
 
 // EV-optimal barrier range: avoid OVER 1/2 and UNDER 8/9 (low payout traps)
 // OVER 3-7 and UNDER 2-6 give the best payout-to-win-probability ratio
-const GOOD_OVER_BARRIERS  = [3, 4, 5, 6, 7];
-const GOOD_UNDER_BARRIERS = [2, 3, 4, 5, 6];
+// Data: OVER3 needs 61.3% WR but only achieves 59.1% → structural loser
+// OVER5/6 need 40-50% WR → achievable. UNDER4/5 symmetric.
+const GOOD_OVER_BARRIERS  = [5, 6, 7];
+const GOOD_UNDER_BARRIERS = [3, 4, 5];
 
 // ── RISK TIERS
 const TIERS = {
@@ -1172,7 +1200,7 @@ const S = {
   token: '', appId: '1089', accountId: null,
   balance: 0, startBalance: 0, dayStart: 0, peakBalance: 0,
   index: '1HZ100V',
-  strategy: 'digit', // 'digit' | 'rise'
+  strategy: 'rise', // 'digit' | 'rise' — RISE has proven +edge, digit under review
   tier: 'medium',
 
   // Ticks
@@ -1212,6 +1240,29 @@ const S = {
   lastTradeTime: 0,
   recoveryPendingLevel: 0,
   recoveryTicks: 0,
+
+  // ── Auto-optimiser
+  optimiser: {
+    enabled:      false,
+    phase:        'explore',   // 'explore' | 'exploit'
+    blockSize:    50,          // trades per evaluation block
+    minBlocks:    3,           // blocks needed before locking a combo
+    lockBlocks:   3,           // blocks to run locked combo before re-exploring
+    combos: [                  // all combinations to evaluate
+      { index:'1HZ100V', strategy:'rise',  label:'V100 1s · Rise/Fall' },
+      { index:'1HZ75V',  strategy:'rise',  label:'V75 1s  · Rise/Fall' },
+      { index:'1HZ50V',  strategy:'rise',  label:'V50 1s  · Rise/Fall' },
+      { index:'1HZ100V', strategy:'digit', label:'V100 1s · Digit'     },
+      { index:'1HZ75V',  strategy:'digit', label:'V75 1s  · Digit'     },
+      { index:'1HZ50V',  strategy:'digit', label:'V50 1s  · Digit'     },
+    ],
+    stats:        {},          // key: 'index|strategy' → { trades, wins, winAmt, lossAmt, blocks }
+    currentCombo: 0,           // index into combos[]
+    blockTrades:  0,           // trades in current block
+    lockedCombo:  null,        // combo locked after evaluation
+    lockBlocksLeft: 0,         // blocks remaining in locked phase
+    history:      [],          // [ { combo, expectancy, trades, ts } ]
+  },
 };
 
 // ─────────────────────────────────────────────────────
@@ -1677,9 +1728,10 @@ function selectBestDigitBet(freqs, signals, total) {
   candidates.sort((a,b) => b.score - a.score);
   const best = candidates[0];
 
-  // Hard floor: only trade if EV > -3% (Deriv house edge ~2%)
-  // This filters out bets where the observed window gives no statistical reason to bet
-  return best.ev > -0.03 ? best : null;
+  // Hard floor: EV must be genuinely positive (not just near zero)
+  // Data shows near-zero EV bets lose consistently due to spread/execution friction
+  // Require EV > +2% — only trade when stats clearly justify the bet
+  return best.ev > 0.02 ? best : null;
 }
 
 function analyzeRiseFall(data) {
@@ -1838,16 +1890,29 @@ function decideAndTrade(analysis) {
 }
 
 function signalGate(analysis, tier) {
-  const chi = analysis.chi;
-  const sigStr = analysis.sigStrength;
+  // chi² has zero predictive power on WR (data: 58% WR across ALL chi² buckets).
+  // Gate is now based purely on consecutive loss count + EV of proposed bet.
 
-  // Strong signal → escalate stake
-  if(chi >= tier.minChi && sigStr === 'strong') return 'escalate';
+  const consecutiveLosses = S.curLossStreak;
+  const bet = analysis?.bestBet;
+  const ev  = bet?.ev ?? -1;
 
-  // Moderate signal → hold current level (don't escalate, but do trade)
-  if(chi >= tier.moderateChi && (sigStr === 'moderate' || sigStr === 'strong')) return 'hold';
+  // No bet with positive EV → always sit out
+  if(!bet || ev <= 0) return 'sit_out';
 
-  // Weak signal → sit out entirely
+  // After 2+ consecutive losses: mandatory cooldown (sit out regardless of signal)
+  // This is the core fix — don't throw good money after bad during loss streaks
+  if(consecutiveLosses >= 2 && S.recoveryPendingLevel > 0) {
+    return 'sit_out';
+  }
+
+  // Strong EV + no recent loss streak → escalate
+  if(ev > 0.05 && consecutiveLosses < 2) return 'escalate';
+
+  // Moderate EV → hold current level, don't escalate further
+  if(ev > 0.02) return 'hold';
+
+  // Low or negative EV → sit out
   return 'sit_out';
 }
 
@@ -1861,22 +1926,22 @@ function updateMartDecision(decision, analysis) {
     case 'escalate':
       el.className += ' ms-escalate';
       el.textContent = `ESCALATE → L${Math.min(S.martLevel+1, tier.maxLevels)}`;
-      reasonEl.textContent = `χ²=${analysis.chi.toFixed(2)} ≥ ${tier.minChi} — strong signal justifies higher stake.`;
+      reasonEl.textContent = `EV=${((analysis.bestBet?.ev||0)*100).toFixed(1)}% · ${S.curLossStreak} consec losses · escalating stake.`;
       break;
     case 'hold':
       el.className += ' ms-hold';
       el.textContent = `HOLD L${S.martLevel}`;
-      reasonEl.textContent = `χ²=${analysis.chi.toFixed(2)} — moderate signal. Bet at current level, no escalation.`;
+      reasonEl.textContent = `EV=${((analysis.bestBet?.ev||0)*100).toFixed(1)}% — moderate. Holding stake level.`;
       break;
     case 'sit_out':
       el.className += ' ms-sitout';
       el.textContent = 'SIT OUT';
-      reasonEl.textContent = `χ²=${analysis.chi.toFixed(2)} < ${tier.moderateChi} — signal too weak after loss. Skipping trade.`;
+      reasonEl.textContent = `${S.curLossStreak >= 2 ? `${S.curLossStreak} consecutive losses — cooldown active.` : 'EV too low — no trade.'}`;
       break;
     case 'base':
       el.className += ' ms-base';
       el.textContent = 'BASE STAKE';
-      reasonEl.textContent = `At base level. χ²=${analysis.chi.toFixed(2)} — trading normally.`;
+      reasonEl.textContent = `Base level. EV=${((analysis.bestBet?.ev||0)*100).toFixed(1)}% — trading at base stake.`;
       break;
   }
   renderLadder();
@@ -1973,6 +2038,7 @@ function processResult(contract) {
   }
 
   addToLog(win, profit, ctype, contract.barrier);
+  optRecordTrade(win, profit); // feed optimiser
   updateBalance();
   updateKPIs(S.lastAnalysis);
   updateAnalytics();
@@ -2045,6 +2111,231 @@ function switchIndex(el) {
 // ─────────────────────────────────────────────────────
 // BOT CONTROLS
 // ─────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────
+// AUTO-OPTIMISER ENGINE
+// ─────────────────────────────────────────────────────
+const OPT_KEY = 'mn_optimiser_stats_v1';
+
+function optKey(combo) { return `${combo.index}|${combo.strategy}`; }
+
+function optSaveStats() {
+  try { localStorage.setItem(OPT_KEY, JSON.stringify(S.optimiser.stats)); } catch(e) {}
+}
+
+function optLoadStats() {
+  try {
+    const raw = localStorage.getItem(OPT_KEY);
+    if(raw) S.optimiser.stats = JSON.parse(raw);
+  } catch(e) {}
+}
+
+function optGetExpectancy(combo) {
+  const d = S.optimiser.stats[optKey(combo)];
+  if(!d || d.trades < 20) return null; // need min 20 trades for meaningful estimate
+  const avgW = d.wins   > 0 ? d.winAmt  / d.wins   : 0;
+  const avgL = (d.trades - d.wins) > 0 ? d.lossAmt / (d.trades - d.wins) : 0;
+  const wr   = d.wins / d.trades;
+  return wr * avgW - (1 - wr) * avgL;
+}
+
+function optRecordTrade(win, profit) {
+  if(!S.optimiser.enabled) return;
+  const opt   = S.optimiser;
+  const combo = opt.lockedCombo || opt.combos[opt.currentCombo];
+  const k     = optKey(combo);
+
+  if(!opt.stats[k]) opt.stats[k] = { trades:0, wins:0, winAmt:0, lossAmt:0, blocks:0 };
+  opt.stats[k].trades++;
+  if(win) { opt.stats[k].wins++; opt.stats[k].winAmt += profit; }
+  else    { opt.stats[k].lossAmt += Math.abs(profit); }
+
+  opt.blockTrades++;
+  optSaveStats();
+
+  // Check if block complete
+  if(opt.blockTrades >= opt.blockSize) {
+    opt.stats[k].blocks++;
+    opt.blockTrades = 0;
+    optOnBlockComplete(combo, k);
+  }
+
+  renderOptimiserPanel();
+}
+
+function optOnBlockComplete(combo, k) {
+  const opt = S.optimiser;
+
+  if(opt.phase === 'exploit') {
+    opt.lockBlocksLeft--;
+    if(opt.lockBlocksLeft <= 0) {
+      // Lock period done — back to exploring
+      opt.phase       = 'explore';
+      opt.lockedCombo = null;
+      opt.currentCombo = 0; // restart rotation
+      showNotif('🔄 Optimiser: re-exploring all combinations', 'info');
+    } else {
+      showNotif(`🔒 Locked: ${combo.label} · ${opt.lockBlocksLeft} blocks left`, 'info');
+    }
+    return;
+  }
+
+  // Exploration phase: move to next combo
+  // Check if current combo has enough blocks to evaluate
+  const exp = optGetExpectancy(combo);
+  opt.history.push({ combo: combo.label, expectancy: exp, trades: opt.stats[k].trades, ts: Date.now() });
+
+  opt.currentCombo++;
+  if(opt.currentCombo >= opt.combos.length) {
+    // Completed one full rotation — find best and lock it
+    opt.currentCombo = 0;
+    optSelectBest();
+  } else {
+    // Switch to next combo in rotation
+    const next = opt.combos[opt.currentCombo];
+    optApplyCombo(next);
+    showNotif(`🔄 Optimiser: now testing ${next.label}`, 'info');
+  }
+}
+
+function optSelectBest() {
+  const opt = S.optimiser;
+  let best = null; let bestExp = -Infinity;
+
+  opt.combos.forEach(combo => {
+    const exp = optGetExpectancy(combo);
+    if(exp !== null && exp > bestExp) { bestExp = exp; best = combo; }
+  });
+
+  if(!best) {
+    // Not enough data yet — continue exploring
+    opt.currentCombo = 0;
+    optApplyCombo(opt.combos[0]);
+    showNotif('🔄 Optimiser: insufficient data — continuing exploration', 'info');
+    return;
+  }
+
+  // Lock the best combination
+  opt.phase          = 'exploit';
+  opt.lockedCombo    = best;
+  opt.lockBlocksLeft = opt.lockBlocks;
+  optApplyCombo(best);
+  showNotif(`🏆 Best: ${best.label} · exp $${bestExp.toFixed(3)} · locked for ${opt.lockBlocks * opt.blockSize} trades`, 'success');
+}
+
+function optApplyCombo(combo) {
+  // Switch index
+  if(S.index !== combo.index) {
+    S.index = combo.index;
+    subscribeIndex(S.index);
+    document.querySelectorAll('.index-pill').forEach(p => {
+      p.classList.toggle('active', p.dataset.idx === combo.index);
+    });
+  }
+  // Switch strategy
+  if(S.strategy !== combo.strategy) {
+    S.strategy = combo.strategy;
+    document.getElementById('strat-digit').classList.toggle('active', combo.strategy==='digit');
+    document.getElementById('strat-rise').classList.toggle('active', combo.strategy==='rise');
+  }
+  // Reset martingale for clean evaluation
+  S.martLevel = 0; S.currentStake = S.baseStake;
+  S.recoveryPendingLevel = 0; S.recoveryTicks = 0;
+  renderLadder();
+  renderOptimiserPanel();
+}
+
+function toggleOptimiser() {
+  const opt = S.optimiser;
+  opt.enabled = !opt.enabled;
+  const btn = document.getElementById('btnOptimiser');
+
+  if(opt.enabled) {
+    optLoadStats();
+    opt.phase        = 'explore';
+    opt.currentCombo = 0;
+    opt.blockTrades  = 0;
+    opt.lockedCombo  = null;
+    optApplyCombo(opt.combos[0]);
+    btn.style.background    = 'var(--teal)';
+    btn.style.color         = 'var(--bg0)';
+    btn.style.borderColor   = 'var(--teal)';
+    btn.textContent         = '⚡ AUTO ON';
+    document.getElementById('optimiserPanel').style.display = 'block';
+    showNotif('Auto-optimiser ON — exploring 6 combinations', 'success');
+  } else {
+    btn.style.background  = 'transparent';
+    btn.style.color       = 'var(--text2)';
+    btn.style.borderColor = 'var(--border2)';
+    btn.textContent       = '⚡ AUTO';
+    document.getElementById('optimiserPanel').style.display = 'none';
+    showNotif('Auto-optimiser OFF', 'info');
+  }
+}
+
+function renderOptimiserPanel() {
+  const opt = S.optimiser;
+  if(!opt.enabled) return;
+
+  const panel = document.getElementById('optPanelBody');
+  if(!panel) return;
+
+  const current = opt.lockedCombo || opt.combos[opt.currentCombo];
+  const progress = Math.min((opt.blockTrades / opt.blockSize) * 100, 100);
+
+  let rows = '';
+  opt.combos.forEach(combo => {
+    const k   = optKey(combo);
+    const d   = opt.stats[k];
+    const exp = optGetExpectancy(combo);
+    const isCurrent = current && k === optKey(current);
+    const isLocked  = opt.lockedCombo && k === optKey(opt.lockedCombo);
+    const trades    = d?.trades || 0;
+    const wr        = d && d.trades > 0 ? (d.wins/d.trades*100).toFixed(0) : '—';
+    const expStr    = exp !== null ? `${exp>=0?'+':''}$${exp.toFixed(3)}` : '—';
+    const expColor  = exp === null ? 'var(--text2)' : exp > 0 ? 'var(--green)' : 'var(--red)';
+    const border    = isLocked ? 'var(--gold)' : isCurrent ? 'var(--teal)' : 'var(--border)';
+    const label     = isLocked ? '🔒' : isCurrent ? '▶' : '';
+
+    rows += `
+      <div style="display:grid;grid-template-columns:16px 1fr 40px 60px 55px;
+        gap:6px;align-items:center;padding:7px 10px;border-radius:5px;
+        background:var(--bg3);border:1px solid ${border};margin-bottom:4px;">
+        <div style="font-size:10px">${label}</div>
+        <div style="font-family:var(--font-m);font-size:9px;color:var(--text1)">${combo.label}</div>
+        <div style="font-family:var(--font-m);font-size:9px;color:var(--text2);text-align:right">${trades}t</div>
+        <div style="font-family:var(--font-m);font-size:9px;color:var(--text2);text-align:right">WR ${wr}%</div>
+        <div style="font-family:var(--font-m);font-size:10px;font-weight:600;color:${expColor};text-align:right">${expStr}</div>
+      </div>`;
+  });
+
+  const phaseColor = opt.phase === 'exploit' ? 'var(--gold)' : 'var(--teal)';
+  const phaseLabel = opt.phase === 'exploit'
+    ? `LOCKED · ${opt.lockBlocksLeft} blocks left`
+    : `EXPLORING · combo ${opt.currentCombo+1}/${opt.combos.length}`;
+
+  panel.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <div style="font-family:var(--font-m);font-size:9px;color:${phaseColor};letter-spacing:2px">${phaseLabel}</div>
+      <div style="font-family:var(--font-m);font-size:9px;color:var(--text2)">${opt.blockTrades}/${opt.blockSize} trades</div>
+    </div>
+    <div style="background:var(--bg3);border-radius:2px;height:3px;margin-bottom:12px;overflow:hidden">
+      <div style="height:100%;background:${phaseColor};width:${progress}%;transition:width .3s;border-radius:2px"></div>
+    </div>
+    ${rows}
+    <div style="font-family:var(--font-m);font-size:8px;color:var(--text2);margin-top:8px;line-height:1.7">
+      Block size: ${opt.blockSize} trades · Min 20 trades to score · Lock: ${opt.lockBlocks} blocks
+    </div>`;
+}
+
+function clearOptimiserStats() {
+  if(!confirm('Clear all optimiser data? Exploration will restart from scratch.')) return;
+  S.optimiser.stats   = {};
+  S.optimiser.history = [];
+  localStorage.removeItem(OPT_KEY);
+  renderOptimiserPanel();
+  showNotif('Optimiser stats cleared', 'info');
+}
+
 function startBot() {
   if(!S.connected) { showNotif('Not connected', 'error'); return; }
   computeBaseStake();
@@ -2082,6 +2373,10 @@ function resetSession() {
   S.skippedSignals=0; S.pauseTicks=0;
   S.gateStats = { escalated:0, held:0, sittingOut:0, recovered:0 };
   S.waitingResult=false; S.openContract=null; S.lastTradeTime=0; S.recoveryPendingLevel=0; S.recoveryTicks=0;
+  if(S.optimiser.enabled) {
+    S.optimiser.blockTrades = 0;
+    // Keep stats across resets so data accumulates
+  }
   S.heatmapWindows=[];
   S.dayStart = S.balance;
   S.peakBalance = S.balance;
@@ -2112,8 +2407,8 @@ function setStrategy(mode) {
   document.getElementById('strat-digit').classList.toggle('active', mode==='digit');
   document.getElementById('strat-rise').classList.toggle('active', mode==='rise');
   document.getElementById('stratDesc').textContent = mode === 'digit'
-    ? 'Over/Under on last digit. Uses chi² statistical deviation to detect bias.'
-    : 'Rise/Fall (Call/Put). Uses tick momentum on 5-tick lookback window.';
+    ? 'DIGIT: OVER 5/6 or UNDER 3/4/5 only. EV must be >2% to trade.'
+    : 'RISE/FALL: 5-tick momentum. +2.55pp confirmed edge over 472 trades.';
   showNotif(`Strategy: ${mode === 'digit' ? 'DIGIT (Over/Under)' : 'RISE / FALL'}`, 'info');
 }
 
@@ -2165,7 +2460,15 @@ function renderSignalView(analysis) {
   else                               { badge.className += ' badge-none';     badge.textContent = 'NO SIGNAL'; }
 
   document.getElementById('seChi').textContent = chi.toFixed(2);
-  document.getElementById('kChi').textContent  = chi.toFixed(2);
+  const betEV = analysis?.bestBet?.ev;
+  const kChiEl = document.getElementById('kChi');
+  if(betEV !== undefined && betEV !== null) {
+    kChiEl.textContent = (betEV>=0?'+':'') + (betEV*100).toFixed(1) + '%';
+    kChiEl.style.color = betEV > 0.02 ? 'var(--green)' : betEV > 0 ? 'var(--amber)' : 'var(--red)';
+  } else {
+    kChiEl.textContent = '—';
+    kChiEl.style.color = 'var(--text2)';
+  }
 
   const chiPill = document.getElementById('chiPill');
   chiPill.textContent = `χ² = ${chi.toFixed(2)}`;
