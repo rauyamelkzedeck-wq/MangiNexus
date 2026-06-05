@@ -689,6 +689,14 @@ canvas { display:block; width:100%; }
     <div class="conn-status">
       <div class="conn-dot" id="connDot"></div>
       <div class="conn-label" id="connLabel">OFFLINE</div>
+      <button id="btnLogout" onclick="logout()" style="display:none;
+        font-family:var(--font-m);font-size:8px;letter-spacing:2px;
+        background:transparent;border:1px solid var(--border2);color:var(--text2);
+        border-radius:4px;padding:3px 8px;cursor:pointer;transition:all .2s;margin-left:4px;
+      " onmouseover="this.style.borderColor='var(--red)',this.style.color='var(--red)'"
+         onmouseout="this.style.borderColor='var(--border2)',this.style.color='var(--text2)'">
+        LOGOUT
+      </button>
     </div>
     <div class="topbar-time" id="topTime">--:--:-- GMT</div>
   </div>
@@ -1083,7 +1091,7 @@ canvas { display:block; width:100%; }
 
       <div class="trade-log-header">
         <div class="tl-title">// Trade History</div>
-        <div style="display:flex;align-items:center;gap:8px">
+        <div style="display:flex;align-items:center;gap:6px">
           <div class="tl-count" id="tlCount">0 trades</div>
           <button id="btnExport" onclick="exportCSV()" disabled style="
             font-family:var(--font-m);font-size:8px;letter-spacing:2px;
@@ -1094,8 +1102,19 @@ canvas { display:block; width:100%; }
              onmouseout="if(!this.disabled)this.style.borderColor='var(--border2)',this.style.color='var(--text2)'">
             ↓ CSV
           </button>
+          <button onclick="clearHistory()" title="Clear saved history" style="
+            font-family:var(--font-m);font-size:8px;letter-spacing:1px;
+            background:transparent;border:1px solid var(--border2);color:var(--text2);
+            border-radius:4px;padding:3px 7px;cursor:pointer;transition:all .2s;
+          " onmouseover="this.style.borderColor='var(--red)',this.style.color='var(--red)'"
+             onmouseout="this.style.borderColor='var(--border2)',this.style.color='var(--text2)'">
+            ✕
+          </button>
         </div>
       </div>
+      <div id="historyBanner" style="display:none;padding:8px 14px;background:rgba(201,168,76,0.08);
+        border-bottom:1px solid rgba(201,168,76,0.2);font-family:var(--font-m);font-size:9px;
+        color:var(--gold);letter-spacing:1px"></div>
       <div class="trade-log" id="tradeLog">
         <div style="padding:20px;text-align:center;font-family:var(--font-m);font-size:10px;color:var(--text2)">
           No trades yet.<br>Start the bot.
@@ -1137,9 +1156,14 @@ const GOOD_UNDER_BARRIERS = [2, 3, 4, 5, 6];
 
 // ── RISK TIERS
 const TIERS = {
-  low:    { stakePct:0.005, mult:1.5, maxLevels:3,  minChi:16.92, moderateChi:11.07, slPct:0.03,  ptPct:0.05,  pauseTicks:5,  name:'LOW' },
-  medium: { stakePct:0.01,  mult:2.0, maxLevels:4,  minChi:11.07, moderateChi:7.00,  slPct:0.08,  ptPct:0.12,  pauseTicks:3,  name:'MEDIUM' },
-  high:   { stakePct:0.02,  mult:2.5, maxLevels:5,  minChi:5.00,  moderateChi:3.00,  slPct:0.20,  ptPct:0.25,  pauseTicks:2,  name:'HIGH' }
+  // Data shows L0 earns ~+$15k, all martingale levels destroy value.
+  // Multipliers slashed to 1.2x max. Escalation requires BOTH cooldown AND strong signal.
+  // Low risk: flat stake only (maxLevels:0 = no martingale)
+  // Medium:   1 recovery level max, 1.2x, 5 tick cooldown before any escalation
+  // High:     2 levels max, 1.3x, 3 tick cooldown
+  low:    { stakePct:0.005, mult:1.0, maxLevels:0,  minChi:16.92, moderateChi:11.07, slPct:0.03,  ptPct:0.05,  pauseTicks:8,  cooldownTicks:8,  name:'LOW' },
+  medium: { stakePct:0.01,  mult:1.2, maxLevels:2,  minChi:16.92, moderateChi:11.07, slPct:0.08,  ptPct:0.12,  pauseTicks:5,  cooldownTicks:5,  name:'MEDIUM' },
+  high:   { stakePct:0.02,  mult:1.3, maxLevels:3,  minChi:11.07, moderateChi:7.00,  slPct:0.20,  ptPct:0.25,  pauseTicks:3,  cooldownTicks:3,  name:'HIGH' }
 };
 
 // ── GLOBAL STATE
@@ -1313,6 +1337,12 @@ async function checkOAuthCallback() {
     }
 
     S.token = workerData.access_token;
+    // Persist session so refresh doesn't log out
+    localStorage.setItem('mn_session', JSON.stringify({
+      token:     S.token,
+      accType:   accType,
+      savedAt:   Date.now()
+    }));
     await initializeAccount(accType);
 
   } catch(err) {
@@ -1351,6 +1381,12 @@ async function initializeAccount(accType) {
 
   const target = accounts.find(a => a.account_type === accType) || accounts[0];
   S.accountId = target.account_id;
+  // Update persisted session with accountId
+  try {
+    const sess = JSON.parse(localStorage.getItem('mn_session') || '{}');
+    sess.accountId = S.accountId;
+    localStorage.setItem('mn_session', JSON.stringify(sess));
+  } catch(e) {}
   setProcSub(`Step 3/3: Opening live feed · ${S.accountId}`);
 
   const otpRes = await fetch(`${API_BASE}/trading/v1/options/accounts/${S.accountId}/otp`, {
@@ -1377,11 +1413,27 @@ function openWebSocket(wsUrl) {
 }
 
 function showOAuthError(msg) {
+  localStorage.removeItem('mn_session'); // clear bad session
   document.getElementById('ccProcessing').style.display = 'none';
   document.getElementById('ccLoginForm').style.display  = 'block';
   document.getElementById('ccOAuthBtn').disabled = false;
   document.getElementById('ccStatus').textContent = '❌ ' + msg;
   showNotif(msg, 'error');
+}
+
+function logout() {
+  localStorage.removeItem('mn_session');
+  S.connected = false;
+  if(S.ws) { S.ws.close(); S.ws = null; }
+  stopBot();
+  setConnDot('', 'OFFLINE');
+  document.getElementById('topBalance').style.display = 'none';
+  document.getElementById('connectOverlay').style.display = 'flex';
+  document.getElementById('ccLoginForm').style.display  = 'block';
+  document.getElementById('ccProcessing').style.display = 'none';
+  document.getElementById('ccOAuthBtn').disabled = false;
+  document.getElementById('ccStatus').textContent = '';
+  showNotif('Logged out', 'info');
 }
 
 function setProcSub(msg) {
@@ -1461,10 +1513,26 @@ function onConnected(bal) {
   setConnDot('live','LIVE');
   document.getElementById('connectOverlay').style.display = 'none';
   document.getElementById('topBalance').style.display = 'block';
+  document.getElementById('btnLogout').style.display = 'inline-block';
   updateBalance();
   send({ balance:1, subscribe:1 });
   subscribeIndex(S.index);
   computeBaseStake();
+  
+  // Restore saved history from previous sessions
+  const snap = loadHistory();
+  if(snap && snap.trades && snap.trades.length > 0) {
+    const savedAt = new Date(snap.savedAt).toLocaleTimeString();
+    const histBanner = document.getElementById('historyBanner');
+    histBanner.style.display = 'block';
+    histBanner.textContent = `↩ ${snap.trades.length} trades restored from ${savedAt} · Net P&L: ${snap.totalPnl >= 0 ? '+' : ''}$${snap.totalPnl.toFixed(2)}`;
+    restoreTradeLog(snap.trades);
+    updateKPIs(null);
+    updateAnalytics();
+    updatePnLCharts();
+    showNotif(`History restored: ${snap.trades.length} trades`, 'success');
+  }
+  
   showNotif(`Connected · $${S.balance.toFixed(2)}`, 'success');
   initUI();
 }
@@ -1687,60 +1755,63 @@ function decideAndTrade(analysis) {
     return;
   }
 
-  // ── SIGNAL-GATED MARTINGALE (v3 — recovery-pending architecture)
-  // After a loss, we enter recovery-pending state.
-  // We wait for the signal to recover to STRONG before escalating stake.
-  // If signal recovers: escalate to pending level.
-  // If signal is moderate: trade at current base level (don't escalate).
-  // If signal is weak OR N ticks pass without recovery: reset to base.
-  const MAX_RECOVERY_TICKS = 8; // ticks to wait for signal before giving up
+  // ── SIGNAL-GATED MARTINGALE (v4 — cooldown-enforced architecture)
+  // Data shows: L0 is profitable, L1+ destroy value when escalated immediately.
+  // Root cause: chi² stays high even after loss (window didn't fully reset).
+  // Fix: enforce mandatory cooldown ticks BEFORE any escalation decision.
+  // During cooldown: trade at BASE stake only — preserve edge, skip recovery attempt.
+  // After cooldown: only escalate if signal is strong AND loss was single (not a streak).
 
   if(S.recoveryPendingLevel > 0) {
     S.recoveryTicks++;
-    const decision = signalGate(analysis, tier);
-    updateMartDecision(decision, analysis);
+    const cooled = S.recoveryTicks >= tier.cooldownTicks;
 
-    if(decision === 'sit_out') {
-      // Weak signal — don't trade, keep waiting
+    if(!cooled) {
+      // Mandatory sit-out cooldown — trade at base stake regardless of signal
+      S.currentStake = S.baseStake;
       S.skippedSignals++;
       document.getElementById('pvSkipped').textContent = S.skippedSignals;
       S.gateStats.sittingOut++;
+      updateMartDecision('sit_out', analysis);
+      // Still allow a BASE trade during cooldown — just at base stake
+      // (don't return — fall through to executeTrade at baseStake)
+    } else {
+      // Cooldown complete — now evaluate signal quality for escalation
+      const decision = signalGate(analysis, tier);
+      updateMartDecision(decision, analysis);
 
-      if(S.recoveryTicks >= MAX_RECOVERY_TICKS) {
-        // Signal never recovered — reset to base, abandon recovery
-        const lostRecovery = S.streakLoss;
-        S.martLevel = 0;
-        S.currentStake = S.baseStake;
+      if(decision === 'escalate') {
+        // Strong signal after cooldown — escalate
+        S.martLevel = Math.min(S.recoveryPendingLevel, tier.maxLevels);
+        S.currentStake = +(S.baseStake * Math.pow(tier.mult, S.martLevel)).toFixed(2);
         S.recoveryPendingLevel = 0;
         S.recoveryTicks = 0;
-        S.streakLoss = 0;
-        showNotif(`⚡ Signal failed to recover — reset to base (abandoned $${lostRecovery.toFixed(2)} recovery)`, 'warn');
-        updateMartDecision('base', analysis);
+        S.gateStats.escalated++;
+      } else if(decision === 'hold') {
+        // Moderate signal — trade at base, extend wait one more cycle
+        S.currentStake = S.baseStake;
+        S.gateStats.held++;
+        if(S.recoveryTicks >= tier.cooldownTicks * 3) {
+          // Too long — abandon recovery entirely
+          S.martLevel = 0; S.streakLoss = 0;
+          S.currentStake = S.baseStake;
+          S.recoveryPendingLevel = 0; S.recoveryTicks = 0;
+          showNotif('Recovery abandoned — back to base stake', 'info');
+          renderLadder();
+        }
+      } else {
+        // Weak signal after cooldown — abandon recovery, reset to base
+        S.martLevel = 0; S.streakLoss = 0;
+        S.currentStake = S.baseStake;
+        S.recoveryPendingLevel = 0; S.recoveryTicks = 0;
+        S.gateStats.sittingOut++;
+        showNotif('Weak signal — recovery abandoned, base stake restored', 'info');
         renderLadder();
+        return; // don't trade on weak signal
       }
-      return;
-    }
-
-    if(decision === 'escalate') {
-      // Strong signal — escalate to the pending level NOW
-      S.martLevel = S.recoveryPendingLevel;
-      S.currentStake = +(S.baseStake * Math.pow(tier.mult, S.martLevel)).toFixed(2);
-      S.recoveryPendingLevel = 0;
-      S.recoveryTicks = 0;
-      S.gateStats.escalated++;
-    }
-
-    if(decision === 'hold') {
-      // Moderate signal — trade at current (not escalated) level, keep waiting for strong
-      // Don't clear recoveryPendingLevel — still hope signal gets stronger
-      S.currentStake = S.martLevel === 0
-        ? S.baseStake
-        : +(S.baseStake * Math.pow(tier.mult, S.martLevel)).toFixed(2);
-      S.gateStats.held++;
     }
 
   } else if(S.martLevel > 0) {
-    // Active martingale level — check if we should continue or step down
     const decision = signalGate(analysis, tier);
     updateMartDecision(decision, analysis);
     if(decision === 'sit_out') {
@@ -1753,7 +1824,6 @@ function decideAndTrade(analysis) {
     if(decision === 'escalate') { S.gateStats.escalated++; }
 
   } else {
-    // Base level — just trade if bet exists
     updateMartDecision('base', analysis);
   }
 
@@ -1907,6 +1977,7 @@ function processResult(contract) {
   updateKPIs(S.lastAnalysis);
   updateAnalytics();
   updatePnLCharts();
+  saveHistory(); // persist after every trade
 }
 
 // ─────────────────────────────────────────────────────
@@ -2066,8 +2137,9 @@ function updateTierSummary() {
   const maxExp = S.baseStake * (Math.pow(t.mult, t.maxLevels+1)-1)/(t.mult-1);
   document.getElementById('tierSummary').innerHTML = `
     Base Stake: $${S.baseStake.toFixed(2)}<br>
-    Multiplier: ${t.mult}x per level<br>
-    Max Levels: ${t.maxLevels}<br>
+    Multiplier: ${t.mult === 1.0 ? 'FLAT (no escalation)' : t.mult + 'x'}<br>
+    Max Levels: ${t.maxLevels === 0 ? 'FLAT STAKE ONLY' : t.maxLevels}<br>
+    Cooldown: ${t.cooldownTicks} ticks after loss<br>
     Gate (strong): χ² ≥ ${t.minChi}<br>
     Gate (moderate): χ² ≥ ${t.moderateChi}<br>
     Daily SL: ${(t.slPct*100).toFixed(0)}% = $${(S.balance*t.slPct).toFixed(2)}<br>
@@ -2685,8 +2757,145 @@ function exportCSV() {
 setInterval(updateClock, 1000);
 updateClock();
 
-// Check for OAuth callback on every page load
-checkOAuthCallback();
+// ─────────────────────────────────────────────────────
+// PERSISTENT HISTORY (localStorage)
+// ─────────────────────────────────────────────────────
+const STORAGE_KEY = 'manginexus_history_v2';
+const MAX_STORED_TRADES = 5000; // keep last 5000 trades across sessions
+
+function saveHistory() {
+  try {
+    const snapshot = {
+      savedAt:       new Date().toISOString(),
+      trades:        S.trades.slice(-MAX_STORED_TRADES),
+      totalPnl:      S.totalPnl,
+      wins:          S.wins,
+      losses:        S.losses,
+      totalWinAmt:   S.totalWinAmt,
+      totalLossAmt:  S.totalLossAmt,
+      bestWin:       S.bestWin,
+      worstLoss:     S.worstLoss,
+      maxWinStreak:  S.maxWinStreak,
+      maxLossStreak: S.maxLossStreak,
+      maxDrawdown:   S.maxDrawdown,
+      pnlHistory:    S.pnlHistory.slice(-2000),
+      skippedSignals:S.skippedSignals,
+      gateStats:     S.gateStats,
+      betBreakdown:  S.betBreakdown,
+      index:         S.index,
+      strategy:      S.strategy,
+      tier:          S.tier,
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
+  } catch(e) { console.warn('Save failed:', e); }
+}
+
+function loadHistory() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if(!raw) return false;
+    const snap = JSON.parse(raw);
+    if(!snap.trades || !snap.savedAt) return false;
+
+    // Restore all state
+    S.trades        = snap.trades || [];
+    S.totalPnl      = snap.totalPnl || 0;
+    S.wins          = snap.wins || 0;
+    S.losses        = snap.losses || 0;
+    S.totalWinAmt   = snap.totalWinAmt || 0;
+    S.totalLossAmt  = snap.totalLossAmt || 0;
+    S.bestWin       = snap.bestWin || 0;
+    S.worstLoss     = snap.worstLoss || 0;
+    S.maxWinStreak  = snap.maxWinStreak || 0;
+    S.maxLossStreak = snap.maxLossStreak || 0;
+    S.maxDrawdown   = snap.maxDrawdown || 0;
+    S.pnlHistory    = snap.pnlHistory || [];
+    S.skippedSignals= snap.skippedSignals || 0;
+    S.gateStats     = snap.gateStats || { escalated:0, held:0, sittingOut:0, recovered:0 };
+    S.betBreakdown  = snap.betBreakdown || {};
+    return snap;
+  } catch(e) { console.warn('Load failed:', e); return false; }
+}
+
+function clearHistory() {
+  if(!confirm('Clear ALL saved trade history? This cannot be undone.')) return;
+  localStorage.removeItem(STORAGE_KEY);
+  resetSession();
+  showNotif('History cleared', 'info');
+}
+
+function restoreTradeLog(trades) {
+  const log = document.getElementById('tradeLog');
+  log.innerHTML = '';
+  const recent = trades.slice(-100).reverse();
+  recent.forEach(t => {
+    const win = t.result === 'WIN';
+    const el = document.createElement('div');
+    el.className = `trade-entry ${win?'win':'loss'}`;
+    const label = t.barrier ? `${t.contract_type} ${t.barrier}` : t.contract_type;
+    el.innerHTML = `
+      <div class="te-top">
+        <span class="te-type" style="color:${win?'var(--green)':'var(--red)'}">
+          ${win?'▲ WIN':'▼ LOSS'} · ${label}
+        </span>
+        <span class="te-pnl" style="color:${win?'var(--green)':'var(--red)'}">
+          ${win?'+':'-'}$${Math.abs(t.profit).toFixed(2)}
+        </span>
+      </div>
+      <div class="te-meta">
+        Stake $${t.stake?.toFixed(2)||'?'} · L${t.mart_level} · ${t.time_gmt} · #${t.trade_no}
+        <span style="color:var(--text2);margin-left:6px">${t.index||''}</span>
+      </div>`;
+    log.appendChild(el);
+  });
+  document.getElementById('tlCount').textContent = trades.length + ' trades';
+  document.getElementById('btnExport').disabled = trades.length === 0;
+}
+
+// On page load: first try OAuth callback, then try silent session restore
+async function initOnLoad() {
+  // Check for OAuth redirect first
+  const params = new URLSearchParams(window.location.search);
+  if(params.get('code') || params.get('error')) {
+    await checkOAuthCallback();
+    return;
+  }
+
+  // No OAuth params — try to restore saved session silently
+  try {
+    const raw = localStorage.getItem('mn_session');
+    if(!raw) return; // No saved session — show login screen
+
+    const sess = JSON.parse(raw);
+    const AGE_LIMIT = 23 * 60 * 60 * 1000; // 23 hours — Deriv tokens last ~24h
+
+    if(!sess.token || (Date.now() - sess.savedAt) > AGE_LIMIT) {
+      // Token too old — clear and show login
+      localStorage.removeItem('mn_session');
+      return;
+    }
+
+    // Token looks valid — show processing screen and try to reconnect silently
+    document.getElementById('ccLoginForm').style.display  = 'none';
+    document.getElementById('ccProcessing').style.display = 'block';
+    setProcSub('Restoring session...');
+
+    S.token     = sess.token;
+    S.appId     = DERIV_APP_ID;
+    S.accountId = sess.accountId || null;
+
+    await initializeAccount(sess.accType || 'demo');
+
+  } catch(err) {
+    // Silent restore failed — clear bad session, show login
+    localStorage.removeItem('mn_session');
+    document.getElementById('ccProcessing').style.display = 'none';
+    document.getElementById('ccLoginForm').style.display  = 'block';
+    console.warn('Session restore failed:', err.message);
+  }
+}
+
+initOnLoad();
 </script>
 </body>
 </html>
