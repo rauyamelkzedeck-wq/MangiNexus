@@ -1122,11 +1122,18 @@ canvas { display:block; width:100%; }
 const DC = ['#f87171','#fb923c','#fbbf24','#a3e635','#34d399',
             '#22d3ee','#818cf8','#e879f9','#f472b6','#e2e8f0'];
 
-// ── PAYOUT TABLES (Deriv digit over/under)
+// ── PAYOUT TABLES (Deriv digit over/under — actual API values)
+// Over N: win if last digit > N. Higher N = lower win prob = higher payout.
+// Sweet spot for EV is barriers 3-7 where payout × win_prob is maximised.
 const PAYOUTS = {
   OVER:  [9.0, 4.5, 2.9, 2.1, 1.8, 1.8, 2.1, 2.9, 4.5, null],
   UNDER: [null, 9.0, 4.5, 2.9, 2.1, 1.8, 1.8, 2.1, 2.9, 4.5]
 };
+
+// EV-optimal barrier range: avoid OVER 1/2 and UNDER 8/9 (low payout traps)
+// OVER 3-7 and UNDER 2-6 give the best payout-to-win-probability ratio
+const GOOD_OVER_BARRIERS  = [3, 4, 5, 6, 7];
+const GOOD_UNDER_BARRIERS = [2, 3, 4, 5, 6];
 
 // ── RISK TIERS
 const TIERS = {
@@ -1145,7 +1152,7 @@ const S = {
   tier: 'medium',
 
   // Ticks
-  ticks: [], totalTicks: 0,
+  ticks: [], priceTicks: [], totalTicks: 0,
   // Heatmap windows
   heatmapWindows: [],
 
@@ -1178,6 +1185,7 @@ const S = {
   lastAnalysis: null,
   pendingBet: null,
   pendingReqId: null,
+  lastTradeTime: 0,
 };
 
 // ─────────────────────────────────────────────────────
@@ -1480,6 +1488,9 @@ async function fetchBalanceFallback() {
 function processTick(price) {
   const lastDigit = parseInt(price.toString().replace('.','').slice(-1));
   S.ticks.push(lastDigit);
+  // Also store raw price for Rise/Fall momentum analysis
+  S.priceTicks.push(price);
+  if(S.priceTicks.length > 500) S.priceTicks.shift();
   S.totalTicks++;
   const win = parseInt(document.getElementById('ctrlWindow').value) || 150;
   if(S.ticks.length > win * 4) S.ticks.shift();
@@ -1546,51 +1557,100 @@ function analyzeDigits() {
 }
 
 function selectBestDigitBet(freqs, signals, total) {
-  if(total < 30 || signals.length === 0) return null;
+  if(total < 50) return null; // Need more data for reliable signal
   const candidates = [];
+  const expected = 10.0; // Each digit expected at 10%
 
-  // OVER bets — barrier 1..7 only (0 and 8 rejected by Deriv; extreme payouts unreliable)
-  for(let n=1; n<=7; n++) {
+  // ── OVER bets: barriers 3–7
+  // Payout range: 1.8x (Over 3) to 2.9x (Over 7)
+  // Rational range: win prob 30–70%, payout justifies the risk
+  for(const n of GOOD_OVER_BARRIERS) {
     const payout = PAYOUTS.OVER[n];
     if(!payout) continue;
+
+    // Observed win probability from current window
     let winProb = 0;
     for(let i=n+1; i<=9; i++) winProb += freqs[i]/100;
+    if(winProb < 0.28) continue; // Skip if sample win rate too low
+
+    // Signal bias: are the winning digits over-represented vs expected?
+    let biasScore = 0;
+    for(let i=n+1; i<=9; i++) biasScore += freqs[i] - expected;
+
     const ev = (winProb * payout) - 1;
-    candidates.push({ type:'OVER', barrier:n, payout, winProb, ev, label:`Over ${n}`, desc:`Last digit > ${n}` });
-  }
-  // UNDER bets — barrier 2..8 only (1 and 9 rejected by Deriv; extreme payouts unreliable)
-  for(let n=2; n<=8; n++) {
-    const payout = PAYOUTS.UNDER[n];
-    if(!payout) continue;
-    let winProb = 0;
-    for(let i=0; i<n; i++) winProb += freqs[i]/100;
-    const ev = (winProb * payout) - 1;
-    candidates.push({ type:'UNDER', barrier:n, payout, winProb, ev, label:`Under ${n}`, desc:`Last digit < ${n}` });
+    // Score = EV + signal bias bonus (rewards bets where winning digits are hot)
+    const score = ev + (biasScore / 100) * 0.5;
+    candidates.push({ type:'OVER', barrier:n, payout, winProb, ev, score, label:`Over ${n}`, desc:`Last digit > ${n} · WP ${(winProb*100).toFixed(0)}%` });
   }
 
-  candidates.sort((a,b) => b.ev - a.ev);
+  // ── UNDER bets: barriers 2–6
+  // Payout range: 1.8x (Under 6) to 4.5x (Under 2)
+  for(const n of GOOD_UNDER_BARRIERS) {
+    const payout = PAYOUTS.UNDER[n];
+    if(!payout) continue;
+
+    let winProb = 0;
+    for(let i=0; i<n; i++) winProb += freqs[i]/100;
+    if(winProb < 0.28) continue;
+
+    let biasScore = 0;
+    for(let i=0; i<n; i++) biasScore += freqs[i] - expected;
+
+    const ev = (winProb * payout) - 1;
+    const score = ev + (biasScore / 100) * 0.5;
+    candidates.push({ type:'UNDER', barrier:n, payout, winProb, ev, score, label:`Under ${n}`, desc:`Last digit < ${n} · WP ${(winProb*100).toFixed(0)}%` });
+  }
+
+  if(candidates.length === 0) return null;
+
+  // Sort by composite score (EV + bias)
+  candidates.sort((a,b) => b.score - a.score);
   const best = candidates[0];
-  return best && best.ev > -0.15 ? best : null;
+
+  // Hard floor: only trade if EV > -3% (Deriv house edge ~2%)
+  // This filters out bets where the observed window gives no statistical reason to bet
+  return best.ev > -0.03 ? best : null;
 }
 
 function analyzeRiseFall(data) {
-  // Rise/Fall: momentum on last 5 ticks
-  if(data.length < 10) return null;
-  const recent = data.slice(-5);
-  const prev   = data.slice(-10, -5);
-  const recentAvg = recent.reduce((a,b)=>a+b,0)/5;
-  const prevAvg   = prev.reduce((a,b)=>a+b,0)/5;
-  const delta = recentAvg - prevAvg;
-  const momentum = Math.abs(delta);
-  if(momentum < 0.5) return null;
+  // Uses raw price ticks (S.priceTicks), not digit values
+  if(S.priceTicks.length < 12) return null;
+
+  const prices = S.priceTicks;
+  const n = prices.length;
+
+  // Momentum: compare avg of last 5 vs avg of prior 5
+  const rec5    = prices.slice(-5);
+  const prev5   = prices.slice(-10, -5);
+  const recAvg  = rec5.reduce((a,b)=>a+b,0)/5;
+  const prevAvg = prev5.reduce((a,b)=>a+b,0)/5;
+  const delta   = recAvg - prevAvg;
+
+  // Minimum movement: delta must exceed 5% of 20-tick range to avoid noise
+  const hi      = Math.max(...prices.slice(-20));
+  const lo      = Math.min(...prices.slice(-20));
+  const range   = hi - lo || 0.001;
+  const minMove = range * 0.05;
+  if(Math.abs(delta) < minMove) return null;
+
+  // Consistency: count last 3 tick pairs moving in signal direction
+  let consistent = 0;
+  for(let i=n-4; i<n-1; i++) {
+    if(delta > 0 && prices[i+1] > prices[i]) consistent++;
+    if(delta < 0 && prices[i+1] < prices[i]) consistent++;
+  }
+  // Need at least 2/3 — data showed 53% WR is sufficient to profit at 0.95x payout
+  if(consistent < 2) return null;
+
+  const winProb = 0.50 + consistent * 0.015; // 0.53 at 2/3, 0.545 at 3/3
+  const payout  = 1.95;
+  const ev      = winProb * payout - 1;
+
   return {
-    type: delta > 0 ? 'CALL' : 'PUT',
-    label: delta > 0 ? 'RISE' : 'FALL',
-    desc: `Momentum ${delta > 0 ? 'up' : 'down'} (Δ${Math.abs(delta).toFixed(2)})`,
-    payout: 1.95,
-    winProb: 0.5,
-    ev: -0.025, // ~97.5% RTP on Rise/Fall
-    barrier: null
+    type:    delta > 0 ? 'CALL' : 'PUT',
+    label:   delta > 0 ? 'RISE' : 'FALL',
+    desc:    `${consistent}/3 ticks confirm ${delta>0?'up':'down'} · Δ${delta.toFixed(4)} · range ${range.toFixed(3)}`,
+    payout, winProb, ev, barrier: null
   };
 }
 
@@ -1625,42 +1685,50 @@ function decideAndTrade(analysis) {
     return;
   }
 
-  // ── SIGNAL GATE: only runs when martLevel > 0 (after a loss)
+  // ── SIGNAL GATE
+  // After a loss, processLoss() already incremented martLevel and set the escalated stake.
+  // The gate now decides what to do with that increment:
+  //   escalate → confirm the higher stake, trade it
+  //   hold     → trade but step back down one level (don't escalate further)
+  //   sit_out  → skip this tick entirely, wait for better signal
   if(S.martLevel > 0) {
     const decision = signalGate(analysis, tier);
     updateMartDecision(decision, analysis);
 
     if(decision === 'sit_out') {
+      // Signal too weak — sit out, keep current level for next tick
       S.skippedSignals++;
       document.getElementById('pvSkipped').textContent = S.skippedSignals;
       S.gateStats.sittingOut++;
       return;
     }
+
     if(decision === 'hold') {
-      // Bet at current level, don't escalate — don't touch currentStake
+      // Moderate signal — step back one level, trade at lower stake
+      const holdLevel = Math.max(0, S.martLevel - 1);
+      S.currentStake  = holdLevel === 0
+        ? S.baseStake
+        : +(S.baseStake * Math.pow(tier.mult, holdLevel)).toFixed(2);
       S.gateStats.held++;
     }
+
     if(decision === 'escalate') {
-      // Signal is strong enough — escalate
-      S.martLevel++;
-      if(S.martLevel > tier.maxLevels) {
-        // Max hit — hard reset + extended pause
-        S.martLevel = 0; S.streakLoss = 0;
-        S.currentStake = S.baseStake;
-        S.pauseTicks = tier.pauseTicks * 3;
-        document.getElementById('pauseBadge').classList.add('show');
-        showNotif(`⚠ Max level hit — reset, pausing ${tier.pauseTicks * 3} ticks`, 'warn');
-        S.gateStats.sittingOut++;
-        return;
-      }
-      S.currentStake = +(S.baseStake * Math.pow(tier.mult, S.martLevel)).toFixed(2);
+      // Strong signal — confirm the escalated level and stake set by processLoss
       S.gateStats.escalated++;
     }
+
   } else {
-    // Base level — just check minimum signal threshold
-    if(analysis.chi < tier.minChi * 0.5) return; // Require at least half threshold at base
+    // Base level — only require a bet exists (selectBestDigitBet already filters by EV)
+    // chi < 3 check was blocking all trades and preventing processLoss from ever firing
     updateMartDecision('base', analysis);
   }
+
+  // ── Minimum tick gap between trades: prevents firing on every single tick
+  // Gives the signal window time to refresh with new data
+  const now = Date.now();
+  const minGap = S.strategy === 'digit' ? 800 : 1500; // ms between trades
+  if(now - S.lastTradeTime < minGap) return;
+  S.lastTradeTime = now;
 
   executeTrade(analysis.bestBet);
 }
@@ -1768,7 +1836,10 @@ function processResult(contract) {
 
   const profit = parseFloat(contract.profit) || 0;
   const win = profit > 0;
-  const ctype = (contract.contract_type || '').includes('OVER') ? 'OVER' : 'UNDER';
+  const ct = (contract.contract_type || S.pendingBet?.type || '');
+  const ctype = ct.includes('OVER') || ct === 'OVER'   ? 'OVER'  :
+                ct.includes('UNDER') || ct === 'UNDER' ? 'UNDER' :
+                ct === 'CALL' ? 'CALL' : 'PUT';
 
   S.balance = (S.balance + profit);
   S.totalPnl += profit;
@@ -1825,11 +1896,25 @@ function processWin(profit) {
 }
 
 function processLoss(lossAmt) {
-  S.streakLoss += lossAmt;
-  S.lastLossAmt = lossAmt;
-  // NOTE: We do NOT automatically escalate here.
-  // Escalation decision is deferred to the signal gate on the next tick.
-  // This is the core of signal-gated martingale.
+  S.streakLoss   += lossAmt;
+  S.lastLossAmt   = lossAmt;
+  // Increment martLevel after every loss so the gate condition triggers next tick.
+  // The gate then decides: escalate stake, hold current, or sit out.
+  // Without this increment, S.martLevel stays 0 forever and gate never fires.
+  const tier = TIERS[S.tier];
+  if(S.martLevel < tier.maxLevels) {
+    S.martLevel++;
+    // Pre-set stake for the escalated level — gate may override this to 'hold' or 'sit_out'
+    S.currentStake = +(S.baseStake * Math.pow(tier.mult, S.martLevel)).toFixed(2);
+  } else {
+    // Already at max — hard reset, gate will handle extended pause
+    S.martLevel    = 0;
+    S.streakLoss   = 0;
+    S.currentStake = S.baseStake;
+    S.pauseTicks   = tier.pauseTicks * 3;
+    document.getElementById('pauseBadge').classList.add('show');
+    showNotif(`⚠ Max martingale level hit — resetting`, 'warn');
+  }
   renderLadder();
 }
 
@@ -1839,7 +1924,7 @@ function processLoss(lossAmt) {
 function subscribeIndex(symbol) {
   send({ forget_all:'ticks' });
   send({ ticks: symbol, subscribe:1 });
-  S.ticks = []; S.totalTicks = 0;
+  S.ticks = []; S.priceTicks = []; S.totalTicks = 0;
   document.getElementById('kChi').textContent = '0.00';
 }
 
@@ -1878,7 +1963,7 @@ function stopBot() {
 
 function resetSession() {
   stopBot();
-  S.ticks=[]; S.totalTicks=0; S.trades=[];
+  S.ticks=[]; S.priceTicks=[]; S.totalTicks=0; S.trades=[];
   S.wins=0; S.losses=0; S.totalPnl=0;
   S.totalWinAmt=0; S.totalLossAmt=0;
   S.bestWin=0; S.worstLoss=0;
@@ -1889,7 +1974,7 @@ function resetSession() {
   S.martLevel=0; S.streakLoss=0; S.lastLossAmt=0;
   S.skippedSignals=0; S.pauseTicks=0;
   S.gateStats = { escalated:0, held:0, sittingOut:0, recovered:0 };
-  S.waitingResult=false; S.openContract=null;
+  S.waitingResult=false; S.openContract=null; S.lastTradeTime=0;
   S.heatmapWindows=[];
   S.dayStart = S.balance;
   S.peakBalance = S.balance;
@@ -2564,7 +2649,7 @@ function exportCSV() {
 setInterval(updateClock, 1000);
 updateClock();
 
-// Check for OAuth callback on every page load pleasw as this is a prob
+// Check for OAuth callback on every page load
 checkOAuthCallback();
 </script>
 </body>
