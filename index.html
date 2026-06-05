@@ -1198,6 +1198,7 @@ const S = {
   ws: null, connected: false, running: false,
   token: '', appId: '1089', accountId: null,
   balance: 0, startBalance: 0, dayStart: 0, peakBalance: 0,
+  sessionStartBalance: 0, // balance at last RUN press — ground truth for session P&L
   index: '1HZ100V',
   strategy: 'rise', // 'digit' | 'rise' — RISE has proven +edge, digit under review
   tier: 'medium',
@@ -1796,19 +1797,23 @@ function decideAndTrade(analysis) {
   const ptDollar = parseFloat(document.getElementById('ctrlPT').value) || 5000;
   const slDollar = parseFloat(document.getElementById('ctrlSL').value) || 2000;
 
-  if(S.totalPnl >= ptDollar) {
+  // Session P&L = balance now minus balance when RUN was pressed
+  // This is ground truth — directly tied to actual account balance change
+  const sessionPnlNow = S.balance - S.sessionStartBalance;
+
+  if(sessionPnlNow >= ptDollar) {
     stopBot();
     showNotif(`✅ Profit target $${ptDollar.toFixed(0)} reached — bot stopped`, 'success');
     document.getElementById('slBanner').textContent =
-      `🎯 Profit target $${ptDollar.toFixed(0)} reached. Session P&L: +$${S.totalPnl.toFixed(2)}. Reset to start a new session.`;
+      `🎯 Profit target $${ptDollar.toFixed(0)} reached. Session gain: +$${sessionPnlNow.toFixed(2)}. Reset to start a new session.`;
     document.getElementById('slBanner').classList.add('show');
     return;
   }
-  if(S.totalPnl <= -slDollar) {
+  if(sessionPnlNow <= -slDollar) {
     stopBot();
     showNotif(`⛔ Stop loss $${slDollar.toFixed(0)} hit — bot stopped`, 'error');
     document.getElementById('slBanner').textContent =
-      `🛑 Stop loss $${slDollar.toFixed(0)} triggered. Session P&L: -$${Math.abs(S.totalPnl).toFixed(2)}. Review before restarting.`;
+      `🛑 Stop loss $${slDollar.toFixed(0)} triggered. Session loss: -$${Math.abs(sessionPnlNow).toFixed(2)}. Review before restarting.`;
     document.getElementById('slBanner').classList.add('show');
     return;
   }
@@ -2290,6 +2295,7 @@ function startBot() {
   if(!S.connected) { showNotif('Not connected', 'error'); return; }
   computeBaseStake();
   S.running = true;
+  S.sessionStartBalance = S.balance; // lock in balance at start of THIS session
   S.dayStart = S.balance;
   S.martLevel = 0;
   S.streakLoss = 0;
@@ -2329,6 +2335,7 @@ function resetSession() {
   }
   S.heatmapWindows=[];
   S.dayStart = S.balance;
+  S.sessionStartBalance = S.balance;
   S.peakBalance = S.balance;
   document.getElementById('tradeLog').innerHTML = '<div style="padding:20px;text-align:center;font-family:var(--font-m);font-size:10px;color:var(--text2)">No trades yet.<br>Start the bot.</div>';
   document.getElementById('tlCount').textContent = '0 trades';
@@ -2504,12 +2511,14 @@ function updateKPIs(analysis) {
   const tot = S.wins + S.losses;
   document.getElementById('kBalance').textContent = '$' + S.balance.toFixed(2);
 
-  const pnl = S.totalPnl;
+  // Session P&L = actual balance change since RUN pressed (ground truth)
+  const pnl = S.sessionStartBalance > 0
+    ? S.balance - S.sessionStartBalance
+    : S.balance - S.startBalance;
   const pnlEl = document.getElementById('kPnl');
   pnlEl.textContent = (pnl>=0?'+':'') + '$' + Math.abs(pnl).toFixed(2);
   pnlEl.style.color = pnl >= 0 ? 'var(--green)' : 'var(--red)';
   document.getElementById('kpi-pnl').className = 'kpi ' + (pnl>=0?'positive':'negative');
-
   if(S.startBalance > 0) {
     document.getElementById('kPnlPct').textContent = (pnl/S.startBalance*100).toFixed(2) + '%';
   }
@@ -2526,7 +2535,7 @@ function updateKPIs(analysis) {
     pfEl.textContent = pf ? pf.toFixed(2) : '∞';
     pfEl.style.color = (!pf || pf >= 1) ? 'var(--green)' : 'var(--red)';
 
-    const exp = S.totalPnl / tot;
+    const exp = (S.totalWinAmt - S.totalLossAmt) / tot;
     const expEl = document.getElementById('kExp');
     expEl.textContent = (exp>=0?'+':'') + '$' + exp.toFixed(3);
     expEl.style.color = exp >= 0 ? 'var(--green)' : 'var(--red)';
@@ -2541,8 +2550,9 @@ function updateBalance() {
   document.getElementById('topBalance').textContent = '$' + b.toFixed(2);
   document.getElementById('kBalance').textContent   = '$' + b.toFixed(2);
   const chg = b - S.startBalance;
-  document.getElementById('kBalChg').textContent = (chg>=0?'+':'') + '$' + chg.toFixed(2);
-  document.getElementById('kBalChg').style.color = chg >= 0 ? 'var(--green)' : 'var(--red)';
+  const sessionChg = S.sessionStartBalance > 0 ? b - S.sessionStartBalance : chg;
+  document.getElementById('kBalChg').textContent = (sessionChg>=0?'+':'') + '$' + sessionChg.toFixed(2);
+  document.getElementById('kBalChg').style.color = sessionChg >= 0 ? 'var(--green)' : 'var(--red)';
   computeBaseStake();
 }
 
@@ -2562,7 +2572,9 @@ function updateGauges() {
   document.getElementById('gStreakVal').textContent = '$'+S.streakLoss.toFixed(2);
   document.getElementById('streakVal').textContent  = '$'+S.streakLoss.toFixed(2);
 
-  const sessionPnl = S.balance - S.dayStart;
+  const sessionPnl = S.sessionStartBalance > 0
+    ? S.balance - S.sessionStartBalance
+    : S.balance - S.dayStart;
   document.getElementById('dailyPnlLbl').textContent = (sessionPnl>=0?'+':'')+'$'+sessionPnl.toFixed(2);
   document.getElementById('dailyPnlLbl').style.color = sessionPnl>=0?'var(--green)':'var(--red)';
   const dailyBar = document.getElementById('dailyBar');
@@ -2597,9 +2609,10 @@ function updateAnalytics() {
   document.getElementById('kPFsub').textContent = pf === '∞' ? 'no losses' : pf >= 1 ? 'profitable' : 'unprofitable';
 
   // P&L View stats
-  document.getElementById('pvPnl').textContent     = (S.totalPnl>=0?'+':'')+'$'+Math.abs(S.totalPnl).toFixed(2);
-  document.getElementById('pvPnl').style.color     = S.totalPnl>=0?'var(--green)':'var(--red)';
-  document.getElementById('pvPnlPct').textContent  = S.startBalance>0?(S.totalPnl/S.startBalance*100).toFixed(2)+'% of start':'—';
+  const _sessionPnl = S.sessionStartBalance > 0 ? S.balance - S.sessionStartBalance : S.balance - S.startBalance;
+  document.getElementById('pvPnl').textContent     = (_sessionPnl>=0?'+':'')+'$'+Math.abs(_sessionPnl).toFixed(2);
+  document.getElementById('pvPnl').style.color     = _sessionPnl>=0?'var(--green)':'var(--red)';
+  document.getElementById('pvPnlPct').textContent  = S.startBalance>0?(_sessionPnl/S.startBalance*100).toFixed(2)+'% of start':'—';
   document.getElementById('pvDD').textContent      = '$'+S.maxDrawdown.toFixed(2);
   document.getElementById('pvDDPct').textContent   = S.peakBalance>0?(S.maxDrawdown/S.peakBalance*100).toFixed(2)+'% of peak':'—';
   document.getElementById('pvTrades').textContent  = tot;
