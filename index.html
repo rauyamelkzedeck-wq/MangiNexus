@@ -762,7 +762,7 @@ canvas { display:block; width:100%; }
     <div class="ctrl-row">
       <div class="ctrl-item">
         <div class="ctrl-lbl">Window (ticks)</div>
-        <input class="ctrl-input" type="number" id="ctrlWindow" value="150" min="50" max="500">
+        <input class="ctrl-input" type="number" id="ctrlWindow" value="50" min="20" max="500">
       </div>
       <div class="ctrl-item">
         <div class="ctrl-lbl">Profit Target $</div>
@@ -1188,9 +1188,9 @@ const TIERS = {
   // L0 net -$319, L1 net -$525. Flat stake only until base edge confirmed >+$0.30/trade.
   // All tiers: maxLevels:0 = pure flat stake. mult irrelevant.
   // Streak circuit breaker: pauseTicks after 5 consecutive losses.
-  low:    { stakePct:0.005, mult:1.0, maxLevels:0, minChi:16.92, moderateChi:11.07, slPct:0.03, ptPct:0.05, pauseTicks:20, cooldownTicks:20, streakBreaker:5, name:'LOW'    },
-  medium: { stakePct:0.01,  mult:1.0, maxLevels:0, minChi:16.92, moderateChi:11.07, slPct:0.08, ptPct:0.12, pauseTicks:15, cooldownTicks:15, streakBreaker:5, name:'MEDIUM' },
-  high:   { stakePct:0.02,  mult:1.0, maxLevels:0, minChi:11.07, moderateChi:7.00,  slPct:0.20, ptPct:0.25, pauseTicks:10, cooldownTicks:10, streakBreaker:4, name:'HIGH'   },
+  low:    { stakePct:0.005, mult:1.0, maxLevels:0, minChi:16.92, moderateChi:11.07, slPct:0.03, ptPct:0.05, pauseTicks:3, cooldownTicks:3, streakBreaker:8, name:'LOW'    },
+  medium: { stakePct:0.01,  mult:1.0, maxLevels:0, minChi:16.92, moderateChi:11.07, slPct:0.08, ptPct:0.12, pauseTicks:3, cooldownTicks:3, streakBreaker:8, name:'MEDIUM' },
+  high:   { stakePct:0.02,  mult:1.0, maxLevels:0, minChi:11.07, moderateChi:7.00,  slPct:0.20, ptPct:0.25, pauseTicks:2, cooldownTicks:2, streakBreaker:6, name:'HIGH'   },
 };
 
 // ── GLOBAL STATE
@@ -1244,7 +1244,7 @@ const S = {
   optimiser: {
     enabled:      false,
     phase:        'explore',   // 'explore' | 'exploit'
-    blockSize:    20,          // trades per evaluation block (reduced: 50 was too slow)
+    blockSize:    15,          // trades per evaluation block — fast switching for demo learning
     minBlocks:    3,           // blocks needed before locking a combo
     lockBlocks:   5,           // blocks (100 trades) to run locked combo before re-exploring
     combos: [
@@ -1734,7 +1734,7 @@ function selectBestDigitBet(freqs, signals, total) {
 
 function analyzeRiseFall(data) {
   // Uses raw price ticks (S.priceTicks), not digit values
-  if(S.priceTicks.length < 12) return null;
+  if(S.priceTicks.length < 8) return null;
 
   const prices = S.priceTicks;
   const n = prices.length;
@@ -1759,8 +1759,8 @@ function analyzeRiseFall(data) {
     if(delta > 0 && prices[i+1] > prices[i]) consistent++;
     if(delta < 0 && prices[i+1] < prices[i]) consistent++;
   }
-  // Need at least 2/3 — data showed 53% WR is sufficient to profit at 0.95x payout
-  if(consistent < 2) return null;
+  // Need at least 1/3 — on demo we want more trades, edge evaluation needs volume
+  if(consistent < 1) return null;
 
   const winProb = 0.50 + consistent * 0.015; // 0.53 at 2/3, 0.545 at 3/3
   const payout  = 1.95;
@@ -1819,7 +1819,8 @@ function decideAndTrade(analysis) {
   S.martLevel = 0;
 
   const bet = analysis?.bestBet;
-  if(!bet || bet.ev <= 0) {
+  if(!bet) {
+    // No valid bet found at all — skip
     S.skippedSignals++;
     document.getElementById('pvSkipped').textContent = S.skippedSignals;
     S.gateStats.sittingOut++;
@@ -1831,7 +1832,7 @@ function decideAndTrade(analysis) {
   // ── Minimum tick gap between trades: prevents firing on every single tick
   // Gives the signal window time to refresh with new data
   const now = Date.now();
-  const minGap = S.strategy === 'digit' ? 800 : 1500; // ms between trades
+  const minGap = S.strategy === 'digit' ? 400 : 600; // ms between trades — reduced for demo
   if(now - S.lastTradeTime < minGap) return;
   S.lastTradeTime = now;
 
