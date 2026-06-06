@@ -1069,6 +1069,25 @@ canvas { display:block; width:100%; }
     </div>
     <!-- /center-panels -->
 
+    <!-- SCORING PANEL — always visible when connected, shows live combo scores -->
+    <div id="scoringPanel" style="display:none;width:220px;flex-shrink:0;
+      background:var(--bg1);border-left:1px solid var(--border);overflow-y:auto;padding:14px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <div style="font-family:var(--font-m);font-size:9px;letter-spacing:3px;color:var(--teal);text-transform:uppercase">// Live Scores</div>
+        <div style="font-family:var(--font-m);font-size:8px;color:var(--text2)">auto-routing</div>
+      </div>
+      <div id="scoringPanelBody">
+        <div style="font-family:var(--font-m);font-size:9px;color:var(--text2);line-height:1.8;text-align:center;padding:20px 0">
+          Connecting to<br>all indices...
+        </div>
+      </div>
+      <div style="margin-top:8px;font-family:var(--font-m);font-size:8px;color:var(--text2);line-height:1.7">
+        Score = confidence + EV×50<br>
+        ▶ = active combo<br>
+        Auto-switches when gap ≥ 15
+      </div>
+    </div>
+
     <!-- OPTIMISER PANEL — shown when auto mode is on -->
     <div id="optimiserPanel" style="display:none;width:260px;flex-shrink:0;
       background:var(--bg1);border-left:1px solid var(--border);
@@ -1184,13 +1203,12 @@ const GOOD_UNDER_BARRIERS = [3, 4, 5];
 
 // ── RISK TIERS
 const TIERS = {
-  // Data (4000+ trades): martingale at ALL levels destroys edge.
-  // L0 net -$319, L1 net -$525. Flat stake only until base edge confirmed >+$0.30/trade.
-  // All tiers: maxLevels:0 = pure flat stake. mult irrelevant.
-  // Streak circuit breaker: pauseTicks after 5 consecutive losses.
-  low:    { stakePct:0.005, mult:1.0, maxLevels:0, minChi:16.92, moderateChi:11.07, slPct:0.03, ptPct:0.05, pauseTicks:3, cooldownTicks:3, streakBreaker:8, name:'LOW'    },
-  medium: { stakePct:0.01,  mult:1.0, maxLevels:0, minChi:16.92, moderateChi:11.07, slPct:0.08, ptPct:0.12, pauseTicks:3, cooldownTicks:3, streakBreaker:8, name:'MEDIUM' },
-  high:   { stakePct:0.02,  mult:1.0, maxLevels:0, minChi:11.07, moderateChi:7.00,  slPct:0.20, ptPct:0.25, pauseTicks:2, cooldownTicks:2, streakBreaker:6, name:'HIGH'   },
+  // Smart martingale — EV-gated + adaptive WR check before escalation.
+  // Low: 1 level max, 1.2x. Medium: 2 levels, 1.3x. High: 3 levels, 1.5x.
+  // minWRtoEscalate: recent win rate needed to justify escalation.
+  low:    { stakePct:0.005, mult:1.2, maxLevels:1, minChi:16.92, moderateChi:11.07, slPct:0.03, ptPct:0.05, pauseTicks:3, cooldownTicks:3, streakBreaker:8, minWRtoEscalate:0.58, name:'LOW'    },
+  medium: { stakePct:0.01,  mult:1.3, maxLevels:2, minChi:16.92, moderateChi:11.07, slPct:0.08, ptPct:0.12, pauseTicks:3, cooldownTicks:3, streakBreaker:7, minWRtoEscalate:0.55, name:'MEDIUM' },
+  high:   { stakePct:0.02,  mult:1.5, maxLevels:3, minChi:11.07, moderateChi:7.00,  slPct:0.20, ptPct:0.25, pauseTicks:2, cooldownTicks:2, streakBreaker:6, minWRtoEscalate:0.52, name:'HIGH'   },
 };
 
 // ── GLOBAL STATE
@@ -1203,10 +1221,21 @@ const S = {
   strategy: 'rise', // 'digit' | 'rise' — RISE has proven +edge, digit under review
   tier: 'medium',
 
-  // Ticks
+  // Active index tick data (for UI display)
   ticks: [], priceTicks: [], totalTicks: 0,
-  // Heatmap windows
   heatmapWindows: [],
+
+  // ── Parallel analysis: per-index data stores
+  // Key: symbol string, value: { ticks, priceTicks, totalTicks }
+  indexData: {},
+  // Scoring results updated every 600ms
+  comboScores: [],   // [ { index, strategy, score, analysis, label } ] sorted best first
+  scoringTimer: null,
+  lastScoreTime: 0,
+
+  // All indices monitored in parallel
+  ALL_INDICES: ['1HZ100V','1HZ75V','1HZ50V'],
+  ALL_STRATEGIES: ['rise','digit'],
 
   // Trading state
   trades: [],
@@ -1245,15 +1274,17 @@ const S = {
   optimiser: {
     enabled:      false,
     phase:        'explore',   // 'explore' | 'exploit'
-    blockSize:    15,          // trades per evaluation block — fast switching for demo learning
+    blockSize:    8,           // 8 trades per block — fast mid-session switching
     minBlocks:    3,           // blocks needed before locking a combo
-    lockBlocks:   5,           // blocks (100 trades) to run locked combo before re-exploring
+    lockBlocks:   4,           // 4 blocks = 32 trades locked, then re-evaluate
     combos: [
-      // DIGIT removed — 4,000+ trades proves structural loser on all indices
-      // Rise/Fall only: confirmed +$0.506 exp/trade on V100 1s over 1,336 trades
-      { index:'1HZ100V', strategy:'rise', label:'V100 1s · Rise/Fall' },
-      { index:'1HZ75V',  strategy:'rise', label:'V75 1s  · Rise/Fall' },
-      { index:'1HZ50V',  strategy:'rise', label:'V50 1s  · Rise/Fall' },
+      // Rise/Fall: confirmed edge. Digit: re-added to rotation — data will decide.
+      { index:'1HZ100V', strategy:'rise',  label:'V100 1s · Rise/Fall' },
+      { index:'1HZ75V',  strategy:'rise',  label:'V75 1s  · Rise/Fall' },
+      { index:'1HZ50V',  strategy:'rise',  label:'V50 1s  · Rise/Fall' },
+      { index:'1HZ100V', strategy:'digit', label:'V100 1s · Digit'     },
+      { index:'1HZ75V',  strategy:'digit', label:'V75 1s  · Digit'     },
+      { index:'1HZ50V',  strategy:'digit', label:'V50 1s  · Digit'     },
     ],
     stats:        {},          // key: 'index|strategy' → { trades, wins, winAmt, lossAmt, blocks }
     currentCombo: 0,           // index into combos[]
@@ -1456,7 +1487,10 @@ async function initializeAccount(accType) {
 function openWebSocket(wsUrl) {
   setProcSub('Connecting to live market data...');
   S.ws = new WebSocket(wsUrl);
-  S.ws.onopen    = () => { send({ balance:1, subscribe:1 }); };
+  S.ws.onopen    = () => {
+    send({ balance:1, subscribe:1 }); // subscribe to real-time balance updates
+    send({ ticks: S.index, subscribe:1 }); // also re-subscribe to ticks
+  };
   S.ws.onmessage = e  => { try { handleMsg(JSON.parse(e.data)); } catch(err) { console.error(err); } };
   S.ws.onerror   = () => { setConnDot('error','ERROR'); showNotif('Connection error', 'error'); };
   S.ws.onclose   = () => { setConnDot('','OFFLINE'); S.connected=false; stopBot(); showNotif('Disconnected','warn'); };
@@ -1503,11 +1537,25 @@ function handleMsg(msg) {
   if(typeof bal === 'number' && !S.connected) { onConnected(bal); return; }
   if(typeof bal === 'number' && S.connected)  { S.balance = bal; updateBalance(); return; }
   if(msg.msg_type === 'authorize') { onConnected(msg.authorize.balance); return; }
-  if(msg.msg_type === 'balance')   { S.balance = parseFloat(msg.balance.balance); updateBalance(); return; }
+  if(msg.msg_type === 'balance') {
+    const realBalance = parseFloat(msg.balance.balance);
+    if(realBalance > 0 && Math.abs(realBalance - S.balance) > 0.01) {
+      console.log(`Balance sync: local $${S.balance.toFixed(2)} → Deriv $${realBalance.toFixed(2)}`);
+      S.balance = realBalance;
+      updateBalance();
+      computeBaseStake(); // recompute stake from real balance
+    }
+    return;
+  }
 
+  // Tick message — route by symbol
+  if(msg.msg_type === 'tick' && msg.tick) {
+    processTick(parseFloat(msg.tick.quote), msg.tick.symbol);
+    return;
+  }
   const quote = msg?.data?.quote ?? msg?.data?.price ?? msg?.tick?.quote;
-  if(quote !== undefined) { processTick(parseFloat(quote)); return; }
-  if(msg.msg_type === 'tick') { processTick(msg.tick.quote); return; }
+  const tickSym = msg?.data?.symbol ?? msg?.tick?.symbol ?? S.index;
+  if(quote !== undefined) { processTick(parseFloat(quote), tickSym); return; }
 
   // Proposal response — validate req_id, then buy immediately
   if(msg.msg_type === 'proposal') {
@@ -1566,8 +1614,9 @@ function onConnected(bal) {
   document.getElementById('btnLogout').style.display = 'inline-block';
   updateBalance();
   send({ balance:1, subscribe:1 });
-  subscribeIndex(S.index);
+  subscribeAllIndices(); // subscribe to ALL indices in parallel
   computeBaseStake();
+  document.getElementById('scoringPanel').style.display = 'block';
   
   // Restore saved history from previous sessions
   const snap = loadHistory();
@@ -1605,28 +1654,50 @@ async function fetchBalanceFallback() {
 // ─────────────────────────────────────────────────────
 // TICK PROCESSING
 // ─────────────────────────────────────────────────────
-function processTick(price) {
+// Route incoming tick to the correct index store
+function processTick(price, symbol) {
+  // Default symbol to active index if not specified
+  const sym = symbol || S.index;
+
+  // Ensure data store exists for this index
+  if(!S.indexData[sym]) {
+    S.indexData[sym] = { ticks:[], priceTicks:[], totalTicks:0 };
+  }
+  const store = S.indexData[sym];
+
   const lastDigit = parseInt(price.toString().replace('.','').slice(-1));
-  S.ticks.push(lastDigit);
-  // Also store raw price for Rise/Fall momentum analysis
-  S.priceTicks.push(price);
-  if(S.priceTicks.length > 500) S.priceTicks.shift();
-  S.totalTicks++;
-  const win = parseInt(document.getElementById('ctrlWindow').value) || 150;
-  if(S.ticks.length > win * 4) S.ticks.shift();
+  store.ticks.push(lastDigit);
+  store.priceTicks.push(price);
+  store.totalTicks++;
 
-  updateTickStream(lastDigit);
-  const analysis = analyzeDigits();
-  S.lastAnalysis = analysis;
-  renderSignalView(analysis);
-  updateKPIs(analysis);
-  updateGauges();
-  updateHeatmapData();
+  const win = parseInt(document.getElementById('ctrlWindow').value) || 50;
+  if(store.ticks.length > win * 4) store.ticks.shift();
+  if(store.priceTicks.length > 500) store.priceTicks.shift();
 
-  // Heatmap snapshot every N ticks
-  if(S.totalTicks % win === 0) captureHeatmapWindow();
+  // Keep active index data mirrored for UI
+  if(sym === S.index) {
+    S.ticks      = store.ticks;
+    S.priceTicks = store.priceTicks;
+    S.totalTicks = store.totalTicks;
+    updateTickStream(lastDigit);
+    const analysis = analyzeDigitsFor(sym);
+    S.lastAnalysis = analysis;
+    renderSignalView(analysis);
+    updateKPIs(analysis);
+    updateGauges();
+    updateHeatmapData();
+    if(S.totalTicks % win === 0) captureHeatmapWindow();
+  }
 
-  if(S.running && !S.waitingResult) {
+  // Trigger scoring pass (throttled to once per 600ms)
+  const now = Date.now();
+  if(now - S.lastScoreTime > 600) {
+    S.lastScoreTime = now;
+    runScoringPass();
+  }
+
+  // Execute trade decision on active combo
+  if(S.running && !S.waitingResult && sym === S.index) {
     if(S.pauseTicks > 0) {
       S.pauseTicks--;
       if(S.pauseTicks === 0) {
@@ -1634,6 +1705,7 @@ function processTick(price) {
         showNotif('Bot resumed', 'info');
       }
     } else {
+      const analysis = S.lastAnalysis || analyzeDigitsFor(sym);
       decideAndTrade(analysis);
     }
   }
@@ -1642,9 +1714,20 @@ function processTick(price) {
 // ─────────────────────────────────────────────────────
 // ANALYSIS ENGINE
 // ─────────────────────────────────────────────────────
+function analyzeDigitsFor(sym) {
+  const store = S.indexData[sym] || { ticks:[], priceTicks:[] };
+  const win = parseInt(document.getElementById('ctrlWindow').value) || 50;
+  const data = store.ticks.slice(-win);
+  const idxPrices = store.priceTicks;
+  return _analyzeDigitsData(data, idxPrices, sym);
+}
+
 function analyzeDigits() {
-  const win = parseInt(document.getElementById('ctrlWindow').value) || 150;
-  const data = S.ticks.slice(-win);
+  return analyzeDigitsFor(S.index);
+}
+
+function _analyzeDigitsData(data, prices, sym) {
+  const win = data.length;
   if(data.length < 20) return null;
 
   const counts = new Array(10).fill(0);
@@ -1671,7 +1754,13 @@ function analyzeDigits() {
   signals.sort((a,b) => a.freq - b.freq);
 
   // Best EV bet
-  const bestBet = S.strategy === 'digit' ? selectBestDigitBet(freqs, signals, total) : analyzeRiseFall(data);
+  // For scoring pass: evaluate BOTH strategies for this index
+  const digitBet = selectBestDigitBet(freqs, signals, total);
+  const riseBet  = analyzeRiseFall(data, prices);
+  const bestBet  = S.strategy === 'digit' ? digitBet : (riseBet || digitBet);
+  // Store both for scoring
+  const _digitBet = digitBet;
+  const _riseBet  = riseBet;
 
   return { freqs, counts, chi, signals, total, bestBet, sigStrength, threshold };
 }
@@ -1733,23 +1822,23 @@ function selectBestDigitBet(freqs, signals, total) {
   return best.ev > 0.02 ? best : null;
 }
 
-function analyzeRiseFall(data) {
-  // Uses raw price ticks (S.priceTicks), not digit values
-  if(S.priceTicks.length < 8) return null;
+function analyzeRiseFall(data, prices) {
+  // Uses raw price ticks, not digit values
+  const priceData = prices || S.priceTicks;
+  if(priceData.length < 8) return null;
 
-  const prices = S.priceTicks;
-  const n = prices.length;
+  const n = priceData.length;
 
   // Momentum: compare avg of last 5 vs avg of prior 5
-  const rec5    = prices.slice(-5);
-  const prev5   = prices.slice(-10, -5);
+  const rec5    = priceData.slice(-5);
+  const prev5   = priceData.slice(-10, -5);
   const recAvg  = rec5.reduce((a,b)=>a+b,0)/5;
   const prevAvg = prev5.reduce((a,b)=>a+b,0)/5;
   const delta   = recAvg - prevAvg;
 
   // Minimum movement: delta must exceed 5% of 20-tick range to avoid noise
-  const hi      = Math.max(...prices.slice(-20));
-  const lo      = Math.min(...prices.slice(-20));
+  const hi      = Math.max(...priceData.slice(-20));
+  const lo      = Math.min(...priceData.slice(-20));
   const range   = hi - lo || 0.001;
   const minMove = range * 0.05;
   if(Math.abs(delta) < minMove) return null;
@@ -1757,8 +1846,8 @@ function analyzeRiseFall(data) {
   // Consistency: count last 3 tick pairs moving in signal direction
   let consistent = 0;
   for(let i=n-4; i<n-1; i++) {
-    if(delta > 0 && prices[i+1] > prices[i]) consistent++;
-    if(delta < 0 && prices[i+1] < prices[i]) consistent++;
+    if(delta > 0 && priceData[i+1] > priceData[i]) consistent++;
+    if(delta < 0 && priceData[i+1] < priceData[i]) consistent++;
   }
   // Need at least 1/3 — on demo we want more trades, edge evaluation needs volume
   if(consistent < 1) return null;
@@ -1818,21 +1907,46 @@ function decideAndTrade(analysis) {
     return;
   }
 
-  // ── FLAT STAKE ONLY (data: all martingale levels destroy edge)
-  // Simple gate: only skip if EV is negative. Otherwise always trade at base stake.
-  S.currentStake = S.baseStake;
-  S.martLevel = 0;
-
+  // ── SMART EV-GATED MARTINGALE
+  // Skip if no valid bet
   const bet = analysis?.bestBet;
   if(!bet) {
-    // No valid bet found at all — skip
     S.skippedSignals++;
     document.getElementById('pvSkipped').textContent = S.skippedSignals;
     S.gateStats.sittingOut++;
     updateMartDecision('sit_out', analysis);
     return;
   }
-  updateMartDecision('base', analysis);
+
+  // Recent win rate for this combo — drives escalation gate
+  const comboKey = `${S.index}|${S.strategy}`;
+  const comboStats = S.optimiser.stats[comboKey];
+  const recentWR = comboStats && comboStats.trades >= 10
+    ? comboStats.wins / comboStats.trades : 0.5;
+
+  // Martingale decision after a loss
+  if(S.recoveryPendingLevel > 0) {
+    const edgeConfirmed = recentWR >= tier.minWRtoEscalate;
+    const signalOk      = bet.ev > -0.02;
+    const streakOk      = S.curLossStreak < 3;
+
+    if(edgeConfirmed && signalOk && streakOk) {
+      S.martLevel    = Math.min(S.recoveryPendingLevel, tier.maxLevels);
+      S.currentStake = +(S.baseStake * Math.pow(tier.mult, S.martLevel)).toFixed(2);
+      S.recoveryPendingLevel = 0;
+      S.gateStats.escalated++;
+      updateMartDecision('escalate', analysis);
+    } else {
+      // Conditions not met — reset to base, don't escalate
+      S.martLevel = 0; S.currentStake = S.baseStake;
+      S.recoveryPendingLevel = 0; S.streakLoss = 0;
+      S.gateStats.sittingOut++;
+      updateMartDecision('base', analysis);
+    }
+  } else {
+    S.currentStake = S.baseStake;
+    updateMartDecision('base', analysis);
+  }
 
   // ── Minimum tick gap between trades: prevents firing on every single tick
   // Gives the signal window time to refresh with new data
@@ -1965,7 +2079,8 @@ function processResult(contract) {
                 ct.includes('UNDER') || ct === 'UNDER' ? 'UNDER' :
                 ct === 'CALL' ? 'CALL' : 'PUT';
 
-  S.balance = (S.balance + profit);
+  // Don't update S.balance locally — Deriv's balance message is the source of truth
+  // S.balance will be updated when the balance subscription fires after trade
   S.totalPnl += profit;
   S.pnlHistory.push(S.totalPnl);
 
@@ -1994,6 +2109,11 @@ function processResult(contract) {
 
   addToLog(win, profit, ctype, contract.barrier);
   optRecordTrade(win, profit); // feed optimiser
+
+  // Request real balance from Deriv after every trade
+  // This prevents local math drift from inflating S.balance
+  send({ balance: 1 });
+
   updateBalance();
   updateKPIs(S.lastAnalysis);
   updateAnalytics();
@@ -2050,22 +2170,193 @@ function processLoss(lossAmt) {
 // INDEX / SUBSCRIPTION
 // ─────────────────────────────────────────────────────
 function subscribeIndex(symbol) {
+  // Subscribe to the specified index (used when manually switching active view)
+  S.index = symbol;
+  // Mirror data if we already have it
+  if(S.indexData[symbol]) {
+    S.ticks      = S.indexData[symbol].ticks;
+    S.priceTicks = S.indexData[symbol].priceTicks;
+    S.totalTicks = S.indexData[symbol].totalTicks;
+  } else {
+    S.ticks=[]; S.priceTicks=[]; S.totalTicks=0;
+  }
+  document.getElementById('kChi').textContent = '—';
+}
+
+function subscribeAllIndices() {
+  // Subscribe to all monitored indices in one call
   send({ forget_all:'ticks' });
-  send({ ticks: symbol, subscribe:1 });
-  S.ticks = []; S.priceTicks = []; S.totalTicks = 0;
-  document.getElementById('kChi').textContent = '0.00';
+  S.ALL_INDICES.forEach(sym => {
+    send({ ticks: sym, subscribe:1 });
+  });
 }
 
 function switchIndex(el) {
   document.querySelectorAll('.index-pill').forEach(p => p.classList.remove('active'));
   el.classList.add('active');
-  S.index = el.dataset.idx;
-  subscribeIndex(S.index);
+  subscribeIndex(el.dataset.idx);
 }
 
 // ─────────────────────────────────────────────────────
 // BOT CONTROLS
 // ─────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────
+// PARALLEL SCORING ENGINE
+// Runs every 600ms across all index+strategy combos
+// Switches active combo when a clearly better one emerges
+// ─────────────────────────────────────────────────────
+// Adaptive performance memory — tracks recent win rate per combo
+// decays toward 0.5 (neutral) every 20 trades, learns from actual results
+function getAdaptiveWeight(sym, strategy) {
+  const key = `${sym}|${strategy}`;
+  const hist = S.optimiser.stats[key];
+  if(!hist || hist.trades < 5) return 1.0; // neutral if no data
+  // Rolling: use last 20 trades only
+  const recentTrades = Math.min(hist.trades, 20);
+  const recentWins   = hist.wins * (recentTrades / hist.trades);
+  const recentWR     = recentWins / recentTrades;
+  // Weight: 1.5x bonus for >60% WR, 0.5x penalty for <40% WR
+  if(recentWR > 0.60) return 1.5;
+  if(recentWR > 0.50) return 1.15;
+  if(recentWR > 0.40) return 0.8;
+  return 0.5; // recent loser — suppress
+}
+
+function scoreCombo(sym, strategy) {
+  const store = S.indexData[sym];
+  if(!store || store.ticks.length < 20) return null;
+
+  const win = parseInt(document.getElementById('ctrlWindow').value) || 50;
+  const data = store.ticks.slice(-win);
+  const scorePrices = store.priceTicks;
+
+  // Get analysis for this combo
+  const counts = new Array(10).fill(0);
+  data.forEach(d => counts[d]++);
+  const total = data.length;
+  const freqs = counts.map(c => (c/total)*100);
+  const expected = total/10;
+  let chi = 0;
+  counts.forEach(c => chi += Math.pow(c-expected,2)/expected);
+
+  let bet = null;
+  let confidence = 0;
+
+  if(strategy === 'digit') {
+    bet = selectBestDigitBet(freqs, [...freqs.map((f,i)=>({digit:i,freq:f})).filter(x=>x.freq<9)], total);
+    if(bet) {
+      // Confidence: EV normalized to 0-100
+      confidence = Math.max(0, Math.min(100, (bet.ev + 0.1) * 500));
+    }
+  } else {
+    bet = analyzeRiseFall(data, scorePrices);
+    if(bet) {
+      // Confidence: based on momentum strength
+      const hi = Math.max(...scorePrices.slice(-20));
+      const lo = Math.min(...scorePrices.slice(-20));
+      const range = hi-lo || 0.001;
+      const rec5 = scorePrices.slice(-5);
+      const prev5 = scorePrices.slice(-10,-5);
+      const delta = rec5.reduce((a,b)=>a+b,0)/5 - prev5.reduce((a,b)=>a+b,0)/5;
+      confidence = Math.min(100, (Math.abs(delta)/range)*300);
+    }
+  }
+
+  if(!bet) return null;
+
+  return {
+    sym, strategy,
+    label: `${sym.replace('1HZ','V').replace('V','V').replace('100V','100 1s').replace('75V','75 1s').replace('50V','50 1s')} · ${strategy==='rise'?'Rise/Fall':'Digit'}`,
+    bet, confidence, chi,
+    ev: bet.ev,
+    score: (confidence + (bet.ev * 50)) * getAdaptiveWeight(sym, strategy) // adaptive composite
+  };
+}
+
+function runScoringPass() {
+  if(!S.running && S.comboScores.length === 0) return;
+
+  const scores = [];
+  S.ALL_INDICES.forEach(sym => {
+    S.ALL_STRATEGIES.forEach(strat => {
+      const result = scoreCombo(sym, strat);
+      if(result) scores.push(result);
+    });
+  });
+
+  // Sort by composite score
+  scores.sort((a,b) => b.score - a.score);
+  S.comboScores = scores;
+
+  // Update scoring panel
+  renderScoringPanel();
+
+  if(!S.running || S.waitingResult) return;
+
+  // Auto-switch if better combo found (only if AUTO optimiser is OFF)
+  // If AUTO is on, the optimiser handles switching
+  if(S.optimiser.enabled) return;
+
+  if(scores.length === 0) return;
+  const best = scores[0];
+  const currentScore = scores.find(s => s.sym === S.index && s.strategy === S.strategy);
+
+  // Switch if best is significantly better AND meets minimum confidence
+  const MIN_CONFIDENCE = 20;
+  const MIN_SCORE_GAP  = 15;
+  const COOLDOWN_MS    = 1500; // don't switch more than once per 1.5s
+
+  if(
+    best.confidence >= MIN_CONFIDENCE &&
+    best.sym !== S.index || best.strategy !== S.strategy
+  ) {
+    const gap = best.score - (currentScore?.score ?? -999);
+    if(gap >= MIN_SCORE_GAP && (Date.now() - (S._lastAutoSwitch||0)) > COOLDOWN_MS) {
+      S._lastAutoSwitch = Date.now();
+      const prevLabel = `${S.index} · ${S.strategy}`;
+      S.index    = best.sym;
+      S.strategy = best.strategy;
+      // Update UI pills
+      document.querySelectorAll('.index-pill').forEach(p =>
+        p.classList.toggle('active', p.dataset.idx === best.sym));
+      document.getElementById('strat-digit').classList.toggle('active', best.strategy==='digit');
+      document.getElementById('strat-rise').classList.toggle('active', best.strategy==='rise');
+      showNotif(`⚡ Auto-switch: ${best.label} (score ${best.score.toFixed(0)} vs ${(currentScore?.score??0).toFixed(0)})`, 'info');
+    }
+  }
+}
+
+function renderScoringPanel() {
+  const el = document.getElementById('scoringPanelBody');
+  if(!el) return;
+  const scores = S.comboScores;
+  if(scores.length === 0) {
+    el.innerHTML = '<div style="font-family:var(--font-m);font-size:9px;color:var(--text2);padding:8px">Accumulating data...</div>';
+    return;
+  }
+
+  el.innerHTML = scores.map((s, i) => {
+    const isActive = s.sym === S.index && s.strategy === S.strategy;
+    const evColor = s.ev > 0 ? 'var(--green)' : s.ev > -0.05 ? 'var(--amber)' : 'var(--red)';
+    const confBar = Math.min(100, s.confidence);
+    const border  = isActive ? 'var(--teal)' : 'var(--border)';
+    const label   = s.label.replace('1HZ','V').replace('100V','100 1s').replace('75V','75 1s').replace('50V','50 1s');
+    return `
+      <div style="display:grid;grid-template-columns:16px 1fr 44px 44px;gap:4px;align-items:center;
+        padding:5px 8px;border-radius:5px;background:var(--bg3);border:1px solid ${border};margin-bottom:3px;">
+        <div style="font-family:var(--font-m);font-size:9px;color:var(--text2)">${isActive?'▶':`${i+1}.`}</div>
+        <div>
+          <div style="font-family:var(--font-m);font-size:9px;color:${isActive?'var(--teal)':'var(--text1)'}">${label}</div>
+          <div style="background:var(--bg0);border-radius:2px;height:3px;margin-top:3px;overflow:hidden">
+            <div style="height:100%;width:${confBar}%;background:${isActive?'var(--teal)':'var(--text2)'};border-radius:2px"></div>
+          </div>
+        </div>
+        <div style="font-family:var(--font-m);font-size:9px;color:${evColor};text-align:right">${s.ev>=0?'+':''}${(s.ev*100).toFixed(1)}%</div>
+        <div style="font-family:var(--font-m);font-size:9px;color:var(--text2);text-align:right">${s.score.toFixed(0)}</div>
+      </div>`;
+  }).join('');
+}
+
 // ─────────────────────────────────────────────────────
 // AUTO-OPTIMISER ENGINE
 // ─────────────────────────────────────────────────────
@@ -2086,7 +2377,7 @@ function optLoadStats() {
 
 function optGetExpectancy(combo) {
   const d = S.optimiser.stats[optKey(combo)];
-  if(!d || d.trades < 15) return null; // need min 15 trades to score (3/4 of block)
+  if(!d || d.trades < 8) return null; // need min 8 trades to score (1 full block)
   const avgW = d.wins   > 0 ? d.winAmt  / d.wins   : 0;
   const avgL = (d.trades - d.wins) > 0 ? d.lossAmt / (d.trades - d.wins) : 0;
   const wr   = d.wins / d.trades;
@@ -2119,49 +2410,84 @@ function optRecordTrade(win, profit) {
 
 function optOnBlockComplete(combo, k) {
   const opt = S.optimiser;
+  const currentExp = optGetExpectancy(combo);
+
+  // Record block result
+  opt.history.push({ combo: combo.label, expectancy: currentExp, trades: opt.stats[k]?.trades || 0, ts: Date.now() });
+
+  // ── MID-SESSION EMERGENCY SWITCH
+  // If current combo is losing AND there's a proven better combo → switch NOW
+  // Don't wait for full rotation to complete
+  if(currentExp !== null && currentExp < -2) {
+    const bestCombo = optFindBest();
+    if(bestCombo && optKey(bestCombo) !== k) {
+      const bestExp = optGetExpectancy(bestCombo);
+      if(bestExp !== null && bestExp > currentExp + 5) {
+        opt.phase        = 'exploit';
+        opt.lockedCombo  = bestCombo;
+        opt.lockBlocksLeft = opt.lockBlocks;
+        optApplyCombo(bestCombo);
+        showNotif(`⚡ Emergency switch → ${bestCombo.label} (was $${currentExp?.toFixed(2)}, now $${bestExp?.toFixed(2)})`, 'warn');
+        return;
+      }
+    }
+  }
 
   if(opt.phase === 'exploit') {
     opt.lockBlocksLeft--;
     if(opt.lockBlocksLeft <= 0) {
-      // Lock period done — back to exploring
-      opt.phase       = 'explore';
-      opt.lockedCombo = null;
-      opt.currentCombo = 0; // restart rotation
+      opt.phase        = 'explore';
+      opt.lockedCombo  = null;
+      opt.currentCombo = 0;
       showNotif('🔄 Optimiser: re-exploring all combinations', 'info');
     } else {
+      // During lock: still check if a clearly better combo has emerged
+      const challenger = optFindBest();
+      if(challenger && optKey(challenger) !== k) {
+        const challengerExp = optGetExpectancy(challenger);
+        if(challengerExp !== null && currentExp !== null && challengerExp > currentExp + 10) {
+          // Challenger is $10+/trade better — switch mid-lock
+          opt.lockedCombo    = challenger;
+          opt.lockBlocksLeft = opt.lockBlocks;
+          optApplyCombo(challenger);
+          showNotif(`🏆 Better combo found mid-lock → ${challenger.label} ($${challengerExp?.toFixed(2)})`, 'success');
+          return;
+        }
+      }
       showNotif(`🔒 Locked: ${combo.label} · ${opt.lockBlocksLeft} blocks left`, 'info');
     }
     return;
   }
 
   // Exploration phase: move to next combo
-  // Check if current combo has enough blocks to evaluate
-  const exp = optGetExpectancy(combo);
-  opt.history.push({ combo: combo.label, expectancy: exp, trades: opt.stats[k].trades, ts: Date.now() });
-
   opt.currentCombo++;
   if(opt.currentCombo >= opt.combos.length) {
-    // Completed one full rotation — find best and lock it
     opt.currentCombo = 0;
     optSelectBest();
   } else {
-    // Switch to next combo in rotation
     const next = opt.combos[opt.currentCombo];
     optApplyCombo(next);
-    showNotif(`🔄 Optimiser: now testing ${next.label}`, 'info');
+    showNotif(`🔄 Testing: ${next.label}`, 'info');
   }
 }
 
-function optSelectBest() {
+// Find best combo across all stats (used for mid-session comparison)
+function optFindBest() {
   const opt = S.optimiser;
   let best = null; let bestExp = -Infinity;
-
   opt.combos.forEach(combo => {
     const exp = optGetExpectancy(combo);
     if(exp !== null && exp > bestExp) { bestExp = exp; best = combo; }
   });
+  return best;
+}
 
-  if(!best) {
+function optSelectBest() {
+  const opt = S.optimiser;
+  const best = optFindBest();
+  const bestExp = best ? optGetExpectancy(best) : null;
+
+  if(!best || bestExp === null) {
     // Not enough data yet — continue exploring
     opt.currentCombo = 0;
     optApplyCombo(opt.combos[0]);
@@ -2237,8 +2563,15 @@ function renderOptimiserPanel() {
   const current = opt.lockedCombo || opt.combos[opt.currentCombo];
   const progress = Math.min((opt.blockTrades / opt.blockSize) * 100, 100);
 
+  // Sort combos by expectancy for display (best first)
+  const sortedCombos = [...opt.combos].sort((a,b) => {
+    const ea = optGetExpectancy(a) ?? -999;
+    const eb = optGetExpectancy(b) ?? -999;
+    return eb - ea;
+  });
+
   let rows = '';
-  opt.combos.forEach(combo => {
+  sortedCombos.forEach((combo, rank) => {
     const k   = optKey(combo);
     const d   = opt.stats[k];
     const exp = optGetExpectancy(combo);
@@ -2246,19 +2579,19 @@ function renderOptimiserPanel() {
     const isLocked  = opt.lockedCombo && k === optKey(opt.lockedCombo);
     const trades    = d?.trades || 0;
     const wr        = d && d.trades > 0 ? (d.wins/d.trades*100).toFixed(0) : '—';
-    const expStr    = exp !== null ? `${exp>=0?'+':''}$${exp.toFixed(3)}` : '—';
+    const expStr    = exp !== null ? `${exp>=0?'+':''}$${exp.toFixed(2)}` : 'no data';
     const expColor  = exp === null ? 'var(--text2)' : exp > 0 ? 'var(--green)' : 'var(--red)';
     const border    = isLocked ? 'var(--gold)' : isCurrent ? 'var(--teal)' : 'var(--border)';
-    const label     = isLocked ? '🔒' : isCurrent ? '▶' : '';
+    const icon      = isLocked ? '🔒' : isCurrent ? '▶' : `${rank+1}.`;
 
     rows += `
-      <div style="display:grid;grid-template-columns:16px 1fr 40px 60px 55px;
-        gap:6px;align-items:center;padding:7px 10px;border-radius:5px;
-        background:var(--bg3);border:1px solid ${border};margin-bottom:4px;">
-        <div style="font-size:10px">${label}</div>
+      <div style="display:grid;grid-template-columns:20px 1fr 36px 50px 58px;
+        gap:5px;align-items:center;padding:6px 10px;border-radius:5px;
+        background:var(--bg3);border:1px solid ${border};margin-bottom:3px;">
+        <div style="font-family:var(--font-m);font-size:9px;color:var(--text2)">${icon}</div>
         <div style="font-family:var(--font-m);font-size:9px;color:var(--text1)">${combo.label}</div>
         <div style="font-family:var(--font-m);font-size:9px;color:var(--text2);text-align:right">${trades}t</div>
-        <div style="font-family:var(--font-m);font-size:9px;color:var(--text2);text-align:right">WR ${wr}%</div>
+        <div style="font-family:var(--font-m);font-size:9px;color:var(--text2);text-align:right">${wr}%WR</div>
         <div style="font-family:var(--font-m);font-size:10px;font-weight:600;color:${expColor};text-align:right">${expStr}</div>
       </div>`;
   });
@@ -2295,7 +2628,9 @@ function startBot() {
   if(!S.connected) { showNotif('Not connected', 'error'); return; }
   computeBaseStake();
   S.running = true;
-  S.sessionStartBalance = S.balance; // lock in balance at start of THIS session
+  // Request fresh balance from Deriv before locking session start
+  send({ balance:1 });
+  S.sessionStartBalance = S.balance; // will be corrected when balance response arrives
   S.dayStart = S.balance;
   S.martLevel = 0;
   S.streakLoss = 0;
@@ -2350,7 +2685,11 @@ function resetSession() {
 
 function computeBaseStake() {
   const tier = TIERS[S.tier];
-  S.baseStake = Math.max(0.35, +(S.balance * tier.stakePct).toFixed(2));
+  // Stake based on real Deriv balance only
+  // Hard cap: stake never exceeds 5% of balance regardless of tier setting
+  const rawStake = S.balance * tier.stakePct;
+  const hardCap  = S.balance * 0.05;
+  S.baseStake = Math.max(0.35, +Math.min(rawStake, hardCap).toFixed(2));
   S.currentStake = S.baseStake;
   document.getElementById('seStake').textContent = '$' + S.currentStake.toFixed(2);
   updateTierSummary();
