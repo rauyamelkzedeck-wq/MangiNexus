@@ -1890,7 +1890,11 @@ function computeKellyStake() {
   const key   = `${S.index}|${S.strategy}`;
   const stats = S.optimiser.stats[key];
 
-  if(!stats || stats.trades < 15) return S.baseStake;
+  // Exploration phase: combo has < 20 trades — use half stake to limit testing cost
+  // This gives untested combos a path to build history without betting full size
+  if(!stats || stats.trades < 10) {
+    return Math.max(0.35, +(S.baseStake * 0.5).toFixed(2));
+  }
 
   const n    = stats.trades;
   const wins = stats.wins;
@@ -2000,30 +2004,11 @@ function decideAndTrade(analysis) {
 }
 
 function signalGate(analysis, tier) {
-  // chi² has zero predictive power on WR (data: 58% WR across ALL chi² buckets).
-  // Gate is now based purely on consecutive loss count + EV of proposed bet.
-
-  const consecutiveLosses = S.curLossStreak;
+  // Simple pass/skip gate — Kelly handles sizing, not this function.
+  // Only skip if there is genuinely no bet available.
   const bet = analysis?.bestBet;
-  const ev  = bet?.ev ?? -1;
-
-  // No bet with positive EV → always sit out
-  if(!bet || ev <= 0) return 'sit_out';
-
-  // After 2+ consecutive losses: mandatory cooldown (sit out regardless of signal)
-  // This is the core fix — don't throw good money after bad during loss streaks
-  if(consecutiveLosses >= 2 && S.recoveryPendingLevel > 0) {
-    return 'sit_out';
-  }
-
-  // Strong EV + no recent loss streak → escalate
-  if(ev > 0.05 && consecutiveLosses < 2) return 'escalate';
-
-  // Moderate EV → hold current level, don't escalate further
-  if(ev > 0.02) return 'hold';
-
-  // Low or negative EV → sit out
-  return 'sit_out';
+  if(!bet) return 'sit_out';
+  return 'base'; // always trade at Kelly-computed stake
 }
 
 function updateMartDecision(decision, analysis) {
@@ -2224,10 +2209,15 @@ function streakSwitch() {
 
   const currentKey = `${S.index}|${S.strategy}`;
 
-  // Find best combo that isn't the current one
-  const best = S.comboScores.find(s =>
-    `${s.sym}|${s.strategy}` !== currentKey && s.confidence > 10
-  );
+  // Only switch to combos with proven trade history (≥20 trades)
+  // Never switch to an untested combo — that's what caused the V25/R_25 losses
+  const MIN_SWITCH_TRADES = 10;
+  const best = S.comboScores.find(s => {
+    if(`${s.sym}|${s.strategy}` === currentKey) return false;
+    if(s.confidence <= 10) return false;
+    const stats = S.optimiser.stats[`${s.sym}|${s.strategy}`];
+    return stats && stats.trades >= MIN_SWITCH_TRADES;
+  });
 
   if(!best) return false;
 
@@ -2347,36 +2337,42 @@ function runScoringPass() {
 
   if(!S.running || S.waitingResult) return;
 
-  // Auto-switch if better combo found (only if AUTO optimiser is OFF)
-  // If AUTO is on, the optimiser handles switching
+  // Auto-switch only if AUTO optimiser is OFF (optimiser handles its own switching)
   if(S.optimiser.enabled) return;
 
   if(scores.length === 0) return;
-  const best = scores[0];
+
+  // Only consider combos with minimum trade history — no switching to untested combos
+  const MIN_TRADES_TO_SWITCH = 10;
+  const MIN_CONFIDENCE       = 25;
+  const MIN_SCORE_GAP        = 20;
+  const COOLDOWN_MS          = 3000; // max one switch per 3s
+
+  // Find best combo that has enough trade history
+  const testedScores = scores.filter(s => {
+    const k = `${s.sym}|${s.strategy}`;
+    const stats = S.optimiser.stats[k];
+    return stats && stats.trades >= MIN_TRADES_TO_SWITCH && s.confidence >= MIN_CONFIDENCE;
+  });
+
+  if(testedScores.length === 0) return; // no tested combos — stay put
+
+  const best = testedScores[0];
+  const currentKey = `${S.index}|${S.strategy}`;
+  if(`${best.sym}|${best.strategy}` === currentKey) return; // already on best
+
   const currentScore = scores.find(s => s.sym === S.index && s.strategy === S.strategy);
+  const gap = best.score - (currentScore?.score ?? -999);
 
-  // Switch if best is significantly better AND meets minimum confidence
-  const MIN_CONFIDENCE = 20;
-  const MIN_SCORE_GAP  = 15;
-  const COOLDOWN_MS    = 1500; // don't switch more than once per 1.5s
-
-  if(
-    best.confidence >= MIN_CONFIDENCE &&
-    best.sym !== S.index || best.strategy !== S.strategy
-  ) {
-    const gap = best.score - (currentScore?.score ?? -999);
-    if(gap >= MIN_SCORE_GAP && (Date.now() - (S._lastAutoSwitch||0)) > COOLDOWN_MS) {
-      S._lastAutoSwitch = Date.now();
-      const prevLabel = `${S.index} · ${S.strategy}`;
-      S.index    = best.sym;
-      S.strategy = best.strategy;
-      // Update UI pills
-      document.querySelectorAll('.index-pill').forEach(p =>
-        p.classList.toggle('active', p.dataset.idx === best.sym));
-      document.getElementById('strat-digit').classList.toggle('active', best.strategy==='digit');
-      document.getElementById('strat-rise').classList.toggle('active', best.strategy==='rise');
-      showNotif(`⚡ Auto-switch: ${best.label} (score ${best.score.toFixed(0)} vs ${(currentScore?.score??0).toFixed(0)})`, 'info');
-    }
+  if(gap >= MIN_SCORE_GAP && (Date.now() - (S._lastAutoSwitch||0)) > COOLDOWN_MS) {
+    S._lastAutoSwitch = Date.now();
+    S.index    = best.sym;
+    S.strategy = best.strategy;
+    document.querySelectorAll('.index-pill').forEach(p =>
+      p.classList.toggle('active', p.dataset.idx === best.sym));
+    document.getElementById('strat-digit').classList.toggle('active', best.strategy==='digit');
+    document.getElementById('strat-rise').classList.toggle('active',  best.strategy==='rise');
+    showNotif(`⚡ Switch → ${best.label} | score ${best.score.toFixed(0)} | ${MIN_TRADES_TO_SWITCH}+ trades tested`, 'info');
   }
 }
 
@@ -2395,8 +2391,12 @@ function renderScoringPanel() {
     const confBar = Math.min(100, s.confidence);
     const border  = isActive ? 'var(--teal)' : 'var(--border)';
     const label   = s.label.replace('1HZ','V').replace('100V','100 1s').replace('75V','75 1s').replace('50V','50 1s');
+    const comboStats = S.optimiser.stats[`${s.sym}|${s.strategy}`];
+    const comboTrades = comboStats?.trades || 0;
+    const exploringLabel = comboTrades < 10 ? `🔬${comboTrades}` : `${comboTrades}t`;
+    const tradeColor = comboTrades < 10 ? 'var(--amber)' : 'var(--text2)';
     return `
-      <div style="display:grid;grid-template-columns:16px 1fr 44px 44px;gap:4px;align-items:center;
+      <div style="display:grid;grid-template-columns:16px 1fr 36px 44px;gap:4px;align-items:center;
         padding:5px 8px;border-radius:5px;background:var(--bg3);border:1px solid ${border};margin-bottom:3px;">
         <div style="font-family:var(--font-m);font-size:9px;color:var(--text2)">${isActive?'▶':`${i+1}.`}</div>
         <div>
@@ -2405,8 +2405,8 @@ function renderScoringPanel() {
             <div style="height:100%;width:${confBar}%;background:${isActive?'var(--teal)':'var(--text2)'};border-radius:2px"></div>
           </div>
         </div>
+        <div style="font-family:var(--font-m);font-size:9px;color:${tradeColor};text-align:right">${exploringLabel}</div>
         <div style="font-family:var(--font-m);font-size:9px;color:${evColor};text-align:right">${s.ev>=0?'+':''}${(s.ev*100).toFixed(1)}%</div>
-        <div style="font-family:var(--font-m);font-size:9px;color:var(--text2);text-align:right">${s.score.toFixed(0)}</div>
       </div>`;
   }).join('');
 }
@@ -2431,7 +2431,7 @@ function optLoadStats() {
 
 function optGetExpectancy(combo) {
   const d = S.optimiser.stats[optKey(combo)];
-  if(!d || d.trades < 8) return null; // need min 8 trades to score (1 full block)
+  if(!d || d.trades < 10) return null; // need 10 trades before eligible for scoring/lock
   const avgW = d.wins   > 0 ? d.winAmt  / d.wins   : 0;
   const avgL = (d.trades - d.wins) > 0 ? d.lossAmt / (d.trades - d.wins) : 0;
   const wr   = d.wins / d.trades;
@@ -2541,11 +2541,20 @@ function optSelectBest() {
   const best = optFindBest();
   const bestExp = best ? optGetExpectancy(best) : null;
 
-  if(!best || bestExp === null) {
-    // Not enough data yet — continue exploring
+  // Count how many combos are still unexplored (< 20 trades)
+  const unexplored = opt.combos.filter(c => {
+    const s = opt.stats[`${c.index}|${c.strategy}`];
+    return !s || s.trades < 10;
+  });
+
+  if(!best || bestExp === null || unexplored.length > opt.combos.length * 0.5) {
+    // More than half the combos still need exploration — keep rotating
     opt.currentCombo = 0;
     optApplyCombo(opt.combos[0]);
-    showNotif('🔄 Optimiser: insufficient data — continuing exploration', 'info');
+    const msg = unexplored.length > 0
+      ? `🔄 Exploring: ${unexplored.length} combos still untested`
+      : '🔄 Insufficient data — continuing exploration';
+    showNotif(msg, 'info');
     return;
   }
 
@@ -2558,6 +2567,16 @@ function optSelectBest() {
 }
 
 function optApplyCombo(combo) {
+  // Check if this is an exploration or exploitation switch
+  const k = `${combo.index}|${combo.strategy}`;
+  const stats = S.optimiser.stats[k];
+  const tradesCount = stats?.trades || 0;
+  const isExploring = tradesCount < 10;
+
+  if(isExploring) {
+    showNotif(`🔬 Exploring ${combo.label} (${tradesCount} trades — half stake)`, 'info');
+  }
+
   // Switch index
   if(S.index !== combo.index) {
     S.index = combo.index;
@@ -2779,7 +2798,7 @@ function setRiskTier(tier) {
 
 function updateTierSummary() {
   const t = TIERS[S.tier];
-  const maxExp = S.baseStake * (Math.pow(t.mult, t.maxLevels+1)-1)/(t.mult-1);
+  const maxExp = S.baseStake * t.maxScale; // Kelly max exposure
   document.getElementById('tierSummary').innerHTML = `
     Base Stake: $${S.baseStake.toFixed(2)}<br>
     Sizing: Fractional Kelly (${(t.kellyFraction*100).toFixed(0)}%)<br>
@@ -2867,15 +2886,20 @@ function renderLadder() {
   const tier = TIERS[S.tier];
   const row = document.getElementById('ladderRow');
   row.innerHTML = '';
-  for(let i=0; i<=tier.maxLevels; i++) {
-    const stake = +(S.baseStake * Math.pow(tier.mult, i)).toFixed(2);
-    const heightPct = ((i+1) / (tier.maxLevels+1)) * 100;
-    const cls = i < S.martLevel ? 'ladder-seg past' : i === S.martLevel ? 'ladder-seg active' : 'ladder-seg future';
+  // Kelly scale visualised as 5 bars: 0.4x, 0.7x, 1.0x (base), 1.5x, 2.5x
+  const kellySteps = [0.4, 0.7, 1.0, 1.5, 2.5];
+  const kellyRatio = S.baseStake > 0 ? S.currentStake / S.baseStake : 1;
+  kellySteps.forEach((step, i) => {
+    const heightPct = ((i+1) / kellySteps.length) * 100;
+    const isActive  = Math.abs(kellyRatio - step) < 0.3;
+    const isPast    = kellyRatio > step + 0.3;
+    const cls = isPast ? 'ladder-seg past' : isActive ? 'ladder-seg active' : 'ladder-seg future';
     row.innerHTML += `<div class="${cls}" style="height:${heightPct}%"><div class="lseg-fill"></div></div>`;
-  }
+  });
+  const _kellyR = S.baseStake > 0 ? S.currentStake / S.baseStake : 1;
   document.getElementById('liStake').textContent   = 'Stake: $' + S.currentStake.toFixed(2);
-  document.getElementById('liStreak').textContent  = 'Streak: $' + S.streakLoss.toFixed(2);
-  document.getElementById('liRecover').textContent = 'Recover: $' + Math.max(0, S.streakLoss).toFixed(2);
+  document.getElementById('liStreak').textContent  = 'Kelly: ' + _kellyR.toFixed(2) + 'x';
+  document.getElementById('liRecover').textContent = 'Base: $' + S.baseStake.toFixed(2);
   const kellyScale = S.baseStake > 0 ? (S.currentStake / S.baseStake) : 1;
   const kLevelEl = document.getElementById('kLevel');
   kLevelEl.textContent = kellyScale.toFixed(2) + 'x';
@@ -2960,7 +2984,7 @@ function updateGauges() {
   const dailyLoss   = Math.max(0, S.dayStart - S.balance);
   const dailyProfit = Math.max(0, S.balance - S.dayStart);
   const tier = TIERS[S.tier];
-  const maxExp = S.baseStake * (Math.pow(tier.mult, tier.maxLevels+1)-1)/(tier.mult-1);
+  const maxExp = S.baseStake * tier.maxScale;
 
   document.getElementById('gLoss').style.width     = Math.min(dailyLoss/sl*100,100)+'%';
   document.getElementById('gLossVal').textContent  = '$'+dailyLoss.toFixed(2);
