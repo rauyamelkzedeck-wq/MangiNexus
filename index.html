@@ -907,7 +907,7 @@ canvas { display:block; width:100%; }
                 <div class="se-mval" id="seChi" style="color:var(--teal)">0.00</div>
               </div>
             </div>
-            <div class="pause-badge" id="pauseBadge">PAUSED</div>
+            <div class="pause-badge" id="pauseBadge">SWITCHING</div>
           </div>
 
           <!-- Martingale State -->
@@ -1719,18 +1719,8 @@ function processTick(price, symbol) {
   }
 
   // Execute trade decision on active combo
-  // Decrement pause counter on ANY tick (not just active index)
-  // With parallel subscriptions, only counting active-index ticks stalls the countdown
-  if(S.running && S.pauseTicks > 0) {
-    S.pauseTicks--;
-    if(S.pauseTicks === 0) {
-      document.getElementById('pauseBadge').classList.remove('show');
-      showNotif('Bot resumed — streak cooldown complete', 'info');
-    }
-  }
-
-  // Trade decisions only on active index tick
-  if(S.running && !S.waitingResult && sym === S.index && S.pauseTicks === 0) {
+  // Trade decisions only on active index tick — no pause system, only switching
+  if(S.running && !S.waitingResult && sym === S.index) {
     const analysis = S.lastAnalysis || analyzeDigitsFor(sym);
     decideAndTrade(analysis);
   }
@@ -1898,13 +1888,16 @@ function decideAndTrade(analysis) {
 
   const tier = TIERS[S.tier];
 
-  // ── STREAK CIRCUIT BREAKER
-  // Data: 116 streaks >3 losses, 22 streaks of 6+. Pause after N consecutive losses.
-  if(S.curLossStreak >= tier.streakBreaker && S.pauseTicks === 0) {
-    S.pauseTicks = tier.pauseTicks;
-    document.getElementById('pauseBadge').classList.add('show');
-    showNotif(`⚡ ${S.curLossStreak} loss streak — pausing ${tier.pauseTicks} ticks`, 'warn');
-    return;
+  // ── STREAK CIRCUIT BREAKER → SMART SWITCH
+  // On loss streak: switch to best available combo instead of pausing.
+  // Bot only stops on daily loss limit — never on streak alone.
+  if(S.curLossStreak >= tier.streakBreaker) {
+    const switched = streakSwitch();
+    if(switched) return; // switched to better combo — skip this trade cycle
+    // No better combo found — reset martingale and continue on current
+    S.martLevel = 0; S.currentStake = S.baseStake;
+    S.recoveryPendingLevel = 0; S.streakLoss = 0;
+    showNotif(`⚡ Streak reset — continuing on ${S.index}`, 'info');
   }
 
   // CHECK SESSION LIMITS — use cumulative session P&L (S.totalPnl)
@@ -1927,7 +1920,7 @@ function decideAndTrade(analysis) {
     stopBot();
     showNotif(`⛔ Stop loss $${slDollar.toFixed(0)} hit — bot stopped`, 'error');
     document.getElementById('slBanner').textContent =
-      `🛑 Stop loss $${slDollar.toFixed(0)} triggered. Session loss: -$${Math.abs(sessionPnlNow).toFixed(2)}. Review before restarting.`;
+      `🛑 Daily loss limit $${slDollar.toFixed(0)} reached. Session: -$${Math.abs(sessionPnlNow).toFixed(2)}. Bot stopped — manual restart required.`;
     document.getElementById('slBanner').classList.add('show');
     return;
   }
@@ -2178,9 +2171,9 @@ function processLoss(lossAmt) {
     S.currentStake = S.baseStake;
     S.recoveryPendingLevel = 0;
     S.recoveryTicks = 0;
-    S.pauseTicks   = tier.pauseTicks * 3;
-    document.getElementById('pauseBadge').classList.add('show');
-    showNotif(`⚠ Max level hit — full reset`, 'warn');
+    showNotif('⚠ Max martingale level hit — resetting to base', 'warn');
+    // Try switching to better combo on max level hit
+    streakSwitch();
   } else {
     // Record what level we WOULD escalate to — but don't do it yet.
     // The gate will confirm or reject escalation based on next signal quality.
@@ -2225,6 +2218,46 @@ function switchIndex(el) {
 // ─────────────────────────────────────────────────────
 // BOT CONTROLS
 // ─────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────
+// STREAK SWITCH — called when loss streak threshold hit
+// Finds best scoring combo that is NOT the current one
+// Returns true if switched, false if no better option found
+// ─────────────────────────────────────────────────────
+function streakSwitch() {
+  if(S.comboScores.length === 0) return false;
+
+  const currentKey = `${S.index}|${S.strategy}`;
+
+  // Find best combo that isn't the current one
+  const best = S.comboScores.find(s =>
+    `${s.sym}|${s.strategy}` !== currentKey && s.confidence > 10
+  );
+
+  if(!best) return false;
+
+  const prevLabel = `${S.index} · ${S.strategy}`;
+  S.index    = best.sym;
+  S.strategy = best.strategy;
+
+  // Reset martingale on switch — clean slate
+  S.martLevel = 0; S.currentStake = S.baseStake;
+  S.recoveryPendingLevel = 0; S.streakLoss = 0;
+  S.curLossStreak = 0; // reset streak counter after switch
+
+  // Update UI pills
+  document.querySelectorAll('.index-pill').forEach(p =>
+    p.classList.toggle('active', p.dataset.idx === best.sym));
+  document.getElementById('strat-digit').classList.toggle('active', best.strategy === 'digit');
+  document.getElementById('strat-rise').classList.toggle('active',  best.strategy === 'rise');
+
+  showNotif(
+    `🔄 Streak switch: ${prevLabel} → ${best.label} (score ${best.score.toFixed(0)})`,
+    'warn'
+  );
+  renderLadder();
+  return true;
+}
+
 // ─────────────────────────────────────────────────────
 // PARALLEL SCORING ENGINE
 // Runs every 600ms across all index+strategy combos
