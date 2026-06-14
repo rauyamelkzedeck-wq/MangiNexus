@@ -678,13 +678,7 @@ canvas { display:block; width:100%; }
     <div class="index-pill active" data-idx="1HZ100V" onclick="switchIndex(this)">V100 1s</div>
     <div class="index-pill" data-idx="1HZ75V"  onclick="switchIndex(this)">V75 1s</div>
     <div class="index-pill" data-idx="1HZ50V"  onclick="switchIndex(this)">V50 1s</div>
-    <div class="index-pill" data-idx="1HZ25V"  onclick="switchIndex(this)">V25 1s</div>
     <div class="index-pill" data-idx="1HZ10V"  onclick="switchIndex(this)">V10 1s</div>
-    <div class="index-pill" data-idx="R_100"   onclick="switchIndex(this)">V100</div>
-    <div class="index-pill" data-idx="R_75"    onclick="switchIndex(this)">V75</div>
-    <div class="index-pill" data-idx="R_50"    onclick="switchIndex(this)">V50</div>
-    <div class="index-pill" data-idx="R_25"    onclick="switchIndex(this)">V25</div>
-    <div class="index-pill" data-idx="R_10"    onclick="switchIndex(this)">V10</div>
   </div>
   <div class="topbar-right">
     <div class="topbar-balance" id="topBalance">$0.00</div>
@@ -1243,10 +1237,11 @@ const S = {
   lastScoreTime: 0,
 
   // All indices monitored in parallel
-  // All Deriv volatility indices that support digit + rise/fall contracts
+  // Data-validated indices only — R_ series and V25 1s consistently lose
+  // V50 1s: +$1416 65%WR | V10 1s: +$471 55%WR | V75 1s: +$264 54%WR
+  // V25 1s: -$939 39%WR (removed) | R_ series: all negative (removed)
   ALL_INDICES: [
-    '1HZ100V','1HZ75V','1HZ50V','1HZ25V','1HZ10V', // 1-second series (faster ticks)
-    'R_100',  'R_75',  'R_50',  'R_25',  'R_10',   // Standard series (2s ticks)
+    '1HZ100V','1HZ75V','1HZ50V','1HZ10V', // proven positive across sessions
   ],
   ALL_STRATEGIES: ['rise','digit'],
 
@@ -1291,28 +1286,16 @@ const S = {
     minBlocks:    3,           // blocks needed before locking a combo
     lockBlocks:   4,           // 4 blocks = 32 trades locked, then re-evaluate
     combos: [
-      // All 10 indices × 2 strategies = 20 combos
-      // Optimiser evaluates all, locks best performer
+      // 8 combos: 4 proven 1s indices × 2 strategies
+      // R_ series removed (consistently losing). V25 1s removed (-$939 39%WR).
       { index:'1HZ100V', strategy:'rise',  label:'V100 1s · Rise/Fall' },
       { index:'1HZ75V',  strategy:'rise',  label:'V75 1s  · Rise/Fall' },
       { index:'1HZ50V',  strategy:'rise',  label:'V50 1s  · Rise/Fall' },
-      { index:'1HZ25V',  strategy:'rise',  label:'V25 1s  · Rise/Fall' },
       { index:'1HZ10V',  strategy:'rise',  label:'V10 1s  · Rise/Fall' },
-      { index:'R_100',   strategy:'rise',  label:'V100    · Rise/Fall' },
-      { index:'R_75',    strategy:'rise',  label:'V75     · Rise/Fall' },
-      { index:'R_50',    strategy:'rise',  label:'V50     · Rise/Fall' },
-      { index:'R_25',    strategy:'rise',  label:'V25     · Rise/Fall' },
-      { index:'R_10',    strategy:'rise',  label:'V10     · Rise/Fall' },
       { index:'1HZ100V', strategy:'digit', label:'V100 1s · Digit'     },
       { index:'1HZ75V',  strategy:'digit', label:'V75 1s  · Digit'     },
       { index:'1HZ50V',  strategy:'digit', label:'V50 1s  · Digit'     },
-      { index:'1HZ25V',  strategy:'digit', label:'V25 1s  · Digit'     },
       { index:'1HZ10V',  strategy:'digit', label:'V10 1s  · Digit'     },
-      { index:'R_100',   strategy:'digit', label:'V100    · Digit'     },
-      { index:'R_75',    strategy:'digit', label:'V75     · Digit'     },
-      { index:'R_50',    strategy:'digit', label:'V50     · Digit'     },
-      { index:'R_25',    strategy:'digit', label:'V25     · Digit'     },
-      { index:'R_10',    strategy:'digit', label:'V10     · Digit'     },
     ],
     stats:        {},          // key: 'index|strategy' → { trades, wins, winAmt, lossAmt, blocks }
     currentCombo: 0,           // index into combos[]
