@@ -1278,6 +1278,12 @@ const S = {
   recoveryPendingLevel: 0,
   recoveryTicks: 0,
 
+  // ── Regime tracking (from quant analysis)
+  regimeBuffer:    [],    // last 20 trade outcomes for active combo [true/false]
+  regimeWR:        0.5,   // rolling win rate (updated after every trade)
+  regimeState:     'neutral', // 'hot' | 'neutral' | 'cold'
+  timeFilterActive: false, // true when current hour is a restricted window
+
   // ── Auto-optimiser
   optimiser: {
     enabled:      false,
@@ -1286,16 +1292,18 @@ const S = {
     minBlocks:    3,           // blocks needed before locking a combo
     lockBlocks:   4,           // 4 blocks = 32 trades locked, then re-evaluate
     combos: [
-      // 8 combos: 4 proven 1s indices × 2 strategies
-      // R_ series removed (consistently losing). V25 1s removed (-$939 39%WR).
-      { index:'1HZ100V', strategy:'rise',  label:'V100 1s · Rise/Fall' },
-      { index:'1HZ75V',  strategy:'rise',  label:'V75 1s  · Rise/Fall' },
-      { index:'1HZ50V',  strategy:'rise',  label:'V50 1s  · Rise/Fall' },
+      // EVIDENCE-BASED COMBO LIST (11,973 trade analysis):
+      // Rise/Fall: V50 1s PRIMARY (+$25,683, exp +$5.90), V10 1s SECONDARY (+$1,391)
+      //            V75 1s NEUTRAL (+$1,085), V100 1s NEUTRAL (+$1,011)
+      // Digit:     V50 1s WEAK+ (+$2,256, 63.5% WR), V75 1s in rotation
+      //            V100 1s REMOVED (-$2,802, BE 64.4% structurally impossible)
+      //            V10 1s Digit: insufficient data, removed
+      { index:'1HZ50V',  strategy:'rise',  label:'V50 1s  · Rise/Fall' }, // PRIMARY
       { index:'1HZ10V',  strategy:'rise',  label:'V10 1s  · Rise/Fall' },
-      { index:'1HZ100V', strategy:'digit', label:'V100 1s · Digit'     },
+      { index:'1HZ75V',  strategy:'rise',  label:'V75 1s  · Rise/Fall' },
+      { index:'1HZ100V', strategy:'rise',  label:'V100 1s · Rise/Fall' },
+      { index:'1HZ50V',  strategy:'digit', label:'V50 1s  · Digit'     }, // WEAK+ edge
       { index:'1HZ75V',  strategy:'digit', label:'V75 1s  · Digit'     },
-      { index:'1HZ50V',  strategy:'digit', label:'V50 1s  · Digit'     },
-      { index:'1HZ10V',  strategy:'digit', label:'V10 1s  · Digit'     },
     ],
     stats:        {},          // key: 'index|strategy' → { trades, wins, winAmt, lossAmt, blocks }
     currentCombo: 0,           // index into combos[]
@@ -1916,35 +1924,65 @@ function computeKellyStake() {
   const key   = `${S.index}|${S.strategy}`;
   const stats = S.optimiser.stats[key];
 
-  // Exploration phase: combo has < 20 trades — use half stake to limit testing cost
-  // This gives untested combos a path to build history without betting full size
+  // Exploration phase: < 10 trades on this combo → half stake
   if(!stats || stats.trades < 10) {
     return Math.max(0.35, +(S.baseStake * 0.5).toFixed(2));
   }
 
+  // ── MOMENTUM-GATED KELLY (from quant analysis)
+  // Trailing 10-trade regime WR drives stake multiplier.
+  // Evidence: +0.32 lag-1 autocorrelation — momentum persists.
+  // Regime states:
+  //   HOT    (WR > 65%): peak hours (08-09, 20-22 GMT) yield 64-69% WR → scale up
+  //   WARM   (WR 55-65%): normal positive regime → base × 1.3
+  //   NEUTRAL(WR 45-55%): no clear edge → base stake
+  //   COLD   (WR < 45%): regime has flipped → base × 0.5 (stay in game, minimal exposure)
+  const momentumWR = S.regimeWR;
+  let scale;
+  if(momentumWR >= 0.65) {
+    scale = tier.maxScale;        // hot — maximise
+    S.regimeState = 'hot';
+  } else if(momentumWR >= 0.55) {
+    scale = Math.min(1.3, tier.maxScale); // warm — above base
+    S.regimeState = 'warm';
+  } else if(momentumWR >= 0.45) {
+    scale = 1.0;                  // neutral — base
+    S.regimeState = 'neutral';
+  } else {
+    scale = tier.minScale;        // cold — protect capital
+    S.regimeState = 'cold';
+  }
+
+  // Additionally apply classic quarter-Kelly as a floor check
+  // Full Kelly = 4.38% (measured across dataset). Quarter = 1.09%.
   const n    = stats.trades;
-  const wins = stats.wins;
-  const wr   = wins / n;
-  const avgW = stats.wins > 0    ? stats.winAmt  / stats.wins          : 0;
-  const avgL = (n - wins) > 0   ? stats.lossAmt / (n - stats.wins)    : 0;
-
-  if(avgW <= 0 || avgL <= 0) return S.baseStake;
-
-  const breakEven = avgL / (avgW + avgL);
-  const edge      = wr - breakEven;
-
-  if(edge <= 0) return +(S.baseStake * tier.minScale).toFixed(2);
-
-  const odds       = avgW / avgL;
-  const rawKelly   = (edge * odds) / avgW;
-  const scale      = Math.max(
-    tier.minScale,
-    Math.min(tier.maxScale, 1 + rawKelly * tier.kellyFraction * 5)
-  );
+  const wr   = stats.wins / n;
+  const avgW = stats.wins > 0       ? stats.winAmt  / stats.wins          : 0;
+  const avgL = (n - stats.wins) > 0 ? stats.lossAmt / (n - stats.wins)    : 0;
+  if(avgW > 0 && avgL > 0) {
+    const be      = avgL / (avgW + avgL);
+    const edge    = wr - be;
+    if(edge > 0) {
+      const rawKelly  = (edge * avgW / avgL) / avgW;
+      const qKelly    = rawKelly * 0.25; // quarter-Kelly fraction
+      // Kelly says max X% of balance — use as a cap, not a floor
+      const kellyCap  = +(S.balance * Math.min(qKelly, 0.04)).toFixed(2);
+      const stakePct  = +(S.baseStake * scale).toFixed(2);
+      const hardCap   = +(S.balance * 0.03).toFixed(2);
+      return Math.max(0.35, Math.min(stakePct, hardCap, kellyCap > 0.35 ? hardCap : hardCap));
+    }
+  }
 
   const stake = +(S.baseStake * scale).toFixed(2);
   const cap   = +(S.balance * 0.03).toFixed(2);
   return Math.max(0.35, Math.min(stake, cap));
+}
+
+// Update regime buffer after every trade result
+function updateRegime(won) {
+  S.regimeBuffer.push(won);
+  if(S.regimeBuffer.length > 10) S.regimeBuffer.shift(); // rolling 10-trade window
+  S.regimeWR = S.regimeBuffer.filter(Boolean).length / S.regimeBuffer.length;
 }
 
 // ─────────────────────────────────────────────────────
@@ -1956,13 +1994,21 @@ function decideAndTrade(analysis) {
 
   const tier = TIERS[S.tier];
 
+  // ── TIME FILTER (from quant analysis: 13:00-14:00 GMT = -$2,015, 48.6% WR)
+  // During restricted hours, only trade if momentum is HOT (WR > 60%)
+  const gmtHour = new Date().getUTCHours();
+  const restrictedHour = (gmtHour === 13); // 13:00-14:00 GMT is structural loser
+  if(restrictedHour && S.regimeState !== 'hot') {
+    // Skip trade during bad hour unless we're on a confirmed hot streak
+    S.skippedSignals++;
+    document.getElementById('pvSkipped').textContent = S.skippedSignals;
+    return;
+  }
+
   // ── STREAK CIRCUIT BREAKER → SMART SWITCH
-  // On loss streak: switch to best available combo instead of pausing.
-  // Bot only stops on daily loss limit — never on streak alone.
   if(S.curLossStreak >= tier.streakBreaker) {
     const switched = streakSwitch();
-    if(switched) return; // switched to better combo — skip this trade cycle
-    // No better combo found — reset martingale and continue on current
+    if(switched) return;
     S.martLevel = 0; S.currentStake = S.baseStake;
     S.recoveryPendingLevel = 0; S.streakLoss = 0;
     showNotif(`⚡ Streak reset — continuing on ${S.index}`, 'info');
@@ -2061,8 +2107,9 @@ function updateMartDecision(decision, analysis) {
       break;
     case 'base':
       el.className += ' ms-base';
-      el.textContent = 'BASE STAKE';
-      reasonEl.textContent = `Base level. EV=${((analysis.bestBet?.ev||0)*100).toFixed(1)}% — trading at base stake.`;
+      const regimeLabel = {hot:'🔥 HOT',warm:'⬆ WARM',neutral:'● NEUTRAL',cold:'❄ COLD'}[S.regimeState]||'BASE';
+      el.textContent = `${regimeLabel} · ${(S.regimeWR*100).toFixed(0)}%WR`;
+      reasonEl.textContent = `Regime: ${S.regimeState} (${S.regimeBuffer.length}-trade WR: ${(S.regimeWR*100).toFixed(0)}%) · EV${((analysis.bestBet?.ev||0)*100).toFixed(1)}%`;
       break;
   }
   renderLadder();
@@ -2161,6 +2208,7 @@ function processResult(contract) {
     showNotif(`❌ LOSS -$${Math.abs(profit).toFixed(2)}`, 'error');
   }
 
+  updateRegime(win);           // update momentum regime (quant analysis change)
   addToLog(win, profit, ctype, contract.barrier);
   optRecordTrade(win, profit); // feed optimiser
 
@@ -2253,10 +2301,11 @@ function streakSwitch() {
   S.index    = best.sym;
   S.strategy = best.strategy;
 
-  // Reset martingale on switch — clean slate
+  // Reset martingale + regime on switch — clean slate for new combo
   S.martLevel = 0; S.currentStake = S.baseStake;
   S.recoveryPendingLevel = 0; S.streakLoss = 0;
-  S.curLossStreak = 0; // reset streak counter after switch
+  S.curLossStreak = 0;
+  S.regimeBuffer = []; S.regimeWR = 0.5; S.regimeState = 'neutral';
 
   // Update UI pills
   document.querySelectorAll('.index-pill').forEach(p =>
@@ -2765,6 +2814,7 @@ function resetSession() {
   S.skippedSignals=0; S.pauseTicks=0;
   S.gateStats = { escalated:0, held:0, sittingOut:0, recovered:0 };
   S.waitingResult=false; S.openContract=null; S.lastTradeTime=0; S.recoveryPendingLevel=0; S.recoveryTicks=0;
+  S.regimeBuffer=[]; S.regimeWR=0.5; S.regimeState='neutral'; S.timeFilterActive=false;
   if(S.optimiser.enabled) {
     S.optimiser.blockTrades = 0;
     // Keep stats across resets so data accumulates
@@ -2931,10 +2981,17 @@ function renderLadder() {
   const kellyScale = S.baseStake > 0 ? (S.currentStake / S.baseStake) : 1;
   const kLevelEl = document.getElementById('kLevel');
   kLevelEl.textContent = kellyScale.toFixed(2) + 'x';
-  kLevelEl.style.color = kellyScale > 1.2 ? 'var(--green)' : kellyScale < 0.8 ? 'var(--red)' : 'var(--gold)';
+  const regimeColors = {hot:'var(--green)',warm:'var(--teal)',neutral:'var(--gold)',cold:'var(--red)'};
+  kLevelEl.style.color = regimeColors[S.regimeState] || 'var(--gold)';
+  const gmtH = new Date().getUTCHours();
+  const peakHour   = (gmtH >= 8 && gmtH <= 9) || (gmtH >= 20 && gmtH <= 22);
+  const dangerHour = gmtH === 13;
   document.getElementById('kDecision').textContent =
-    kellyScale > 1.5 ? 'SCALING UP' : kellyScale > 1.1 ? 'ABOVE BASE' :
-    kellyScale < 0.7 ? 'REDUCED' : 'BASE';
+    dangerHour ? '⚠ BAD HOUR' :
+    peakHour   ? '⭐ PEAK HOUR' :
+    S.regimeState === 'hot'     ? '🔥 HOT' :
+    S.regimeState === 'warm'    ? '⬆ WARM' :
+    S.regimeState === 'cold'    ? '❄ COLD' : 'NEUTRAL';
 }
 
 function updateTickStream(d) {
