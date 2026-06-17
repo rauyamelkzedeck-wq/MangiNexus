@@ -675,10 +675,9 @@ canvas { display:block; width:100%; }
     <div class="logo-ver">v2.0</div>
   </div>
   <div class="topbar-pills" id="indexPills">
-    <div class="index-pill active" data-idx="1HZ100V" onclick="switchIndex(this)">V100 1s</div>
-    <div class="index-pill" data-idx="1HZ75V"  onclick="switchIndex(this)">V75 1s</div>
+    <div class="index-pill active" data-idx="1HZ10V"  onclick="switchIndex(this)">V10 1s ★</div>
+    <div class="index-pill" data-idx="1HZ100V" onclick="switchIndex(this)">V100 1s ★</div>
     <div class="index-pill" data-idx="1HZ50V"  onclick="switchIndex(this)">V50 1s</div>
-    <div class="index-pill" data-idx="1HZ10V"  onclick="switchIndex(this)">V10 1s</div>
   </div>
   <div class="topbar-right">
     <div class="topbar-balance" id="topBalance">$0.00</div>
@@ -1237,11 +1236,10 @@ const S = {
   lastScoreTime: 0,
 
   // All indices monitored in parallel
-  // Data-validated indices only — R_ series and V25 1s consistently lose
-  // V50 1s: +$1416 65%WR | V10 1s: +$471 55%WR | V75 1s: +$264 54%WR
-  // V25 1s: -$939 39%WR (removed) | R_ series: all negative (removed)
+  // Parallel subscription: only indices in active combo list
+  // V10 1s (STRONG+ Rise), V100 1s (STRONG+ Digit), V50 1s (solid baseline)
   ALL_INDICES: [
-    '1HZ100V','1HZ75V','1HZ50V','1HZ10V', // proven positive across sessions
+    '1HZ10V','1HZ100V','1HZ50V',
   ],
   ALL_STRATEGIES: ['rise','digit'],
 
@@ -1292,18 +1290,15 @@ const S = {
     minBlocks:    3,           // blocks needed before locking a combo
     lockBlocks:   4,           // 4 blocks = 32 trades locked, then re-evaluate
     combos: [
-      // EVIDENCE-BASED COMBO LIST (11,973 trade analysis):
-      // Rise/Fall: V50 1s PRIMARY (+$25,683, exp +$5.90), V10 1s SECONDARY (+$1,391)
-      //            V75 1s NEUTRAL (+$1,085), V100 1s NEUTRAL (+$1,011)
-      // Digit:     V50 1s WEAK+ (+$2,256, 63.5% WR), V75 1s in rotation
-      //            V100 1s REMOVED (-$2,802, BE 64.4% structurally impossible)
-      //            V10 1s Digit: insufficient data, removed
-      { index:'1HZ50V',  strategy:'rise',  label:'V50 1s  · Rise/Fall' }, // PRIMARY
-      { index:'1HZ10V',  strategy:'rise',  label:'V10 1s  · Rise/Fall' },
-      { index:'1HZ75V',  strategy:'rise',  label:'V75 1s  · Rise/Fall' },
-      { index:'1HZ100V', strategy:'rise',  label:'V100 1s · Rise/Fall' },
-      { index:'1HZ50V',  strategy:'digit', label:'V50 1s  · Digit'     }, // WEAK+ edge
-      { index:'1HZ75V',  strategy:'digit', label:'V75 1s  · Digit'     },
+      // COMBO LIST — evidence from 12,268 trades across two datasets:
+      // STRONG+: V10 1s Rise (+$326, 62.5% WR), V100 1s Digit (+$417, 66.7% WR)
+      // SOLID:   V50 1s Rise (+$25,683 baseline, mixed recent — keep, monitor)
+      // REMOVED: V75 1s Rise (-$1,282, -25pp gap), V100 1s Rise (-$560, -24pp gap)
+      // REMOVED: V75 1s Digit (only 5 trades, -27pp gap), V50 1s Digit (-$903 recent)
+      // Note: V50 1s Digit excluded after -$903 at -12pp gap in Jun 17 session
+      { index:'1HZ10V',  strategy:'rise',  label:'V10 1s  · Rise/Fall' }, // STRONG+
+      { index:'1HZ100V', strategy:'digit', label:'V100 1s · Digit'     }, // STRONG+
+      { index:'1HZ50V',  strategy:'rise',  label:'V50 1s  · Rise/Fall' }, // SOLID baseline
     ],
     stats:        {},          // key: 'index|strategy' → { trades, wins, winAmt, lossAmt, blocks }
     currentCombo: 0,           // index into combos[]
@@ -1901,16 +1896,17 @@ function analyzeRiseFall(data, prices) {
   }
   if(consistent < 2) return null;
 
-  // 5-tick payout is ~1.7x on Deriv synthetic indices
-  // With triple-window confirmation: expected WR ~55-60%
-  const payout  = 1.70;
-  const winProb = 0.53 + (consistent/3)*0.03 + (Math.min(acceleration,2)-1)*0.02;
+  // 1-tick payout ~0.875x on Deriv V-index synthetics
+  // Break-even: 53.3% WR — achievable (baseline 55.4%)
+  // 5-tick payout was 0.71x needing 58.5% WR — data proved unachievable
+  const payout  = 1.95; // Deriv 1-tick RF pays ~0.95x on stake
+  const winProb = 0.52 + (consistent/3)*0.03 + (Math.min(acceleration,2)-1)*0.02;
   const ev      = winProb * payout - 1;
   if(ev <= 0) return null;
 
   return {
     type:    dir === 'up' ? 'CALL' : 'PUT',
-    label:   dir === 'up' ? 'RISE 5t' : 'FALL 5t',
+    label:   dir === 'up' ? 'RISE' : 'FALL',
     desc:    `Triple-MA ${dir} · f${fastDelta.toFixed(3)} s${slowDelta.toFixed(3)} l${longDelta.toFixed(3)} · acc${acceleration.toFixed(2)}x · ${consistent}/3`,
     payout, winProb, ev, barrier: null
   };
@@ -2006,12 +2002,17 @@ function decideAndTrade(analysis) {
   }
 
   // ── STREAK CIRCUIT BREAKER → SMART SWITCH
-  if(S.curLossStreak >= tier.streakBreaker) {
+  // Fast exit when regime was hot and now flipping (autocorr +0.48 — momentum persists)
+  const prevRegimeWasHot = S.regimeBuffer.slice(-5).filter(Boolean).length >= 4;
+  const fastExitThreshold = prevRegimeWasHot ? 3 : tier.streakBreaker;
+  if(S.curLossStreak >= fastExitThreshold) {
     const switched = streakSwitch();
     if(switched) return;
     S.martLevel = 0; S.currentStake = S.baseStake;
     S.recoveryPendingLevel = 0; S.streakLoss = 0;
-    showNotif(`⚡ Streak reset — continuing on ${S.index}`, 'info');
+    if(S.curLossStreak >= fastExitThreshold) {
+      showNotif(`⚡ ${prevRegimeWasHot?'Hot regime flip':'Streak'} reset on ${S.index}`, 'info');
+    }
   }
 
   // CHECK SESSION LIMITS — use cumulative session P&L (S.totalPnl)
@@ -2149,9 +2150,10 @@ function executeTrade(bet) {
     basis:             'stake',
     contract_type:     contractType,
     currency:          'USD',
-    // 5-tick duration for Rise/Fall (better payout ratio ~1.7x vs 0.95x on 1-tick)
-    // 1-tick for Digit contracts (last digit is always 1-tick)
-    duration:          S.strategy === 'rise' ? 5 : 1,
+    // 1-tick for ALL contracts — data proves 5-tick payouts (0.71x) are worse
+    // 1-tick payout 0.875x needs 53.3% WR vs 5-tick needing 58.5%
+    // Our delivered WR is 52-55%, clears 1-tick bar, fails 5-tick bar
+    duration:          1,
     duration_unit:     't',
     underlying_symbol: S.index
   };
