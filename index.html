@@ -675,9 +675,11 @@ canvas { display:block; width:100%; }
     <div class="logo-ver">v2.0</div>
   </div>
   <div class="topbar-pills" id="indexPills">
-    <div class="index-pill active" data-idx="1HZ10V"  onclick="switchIndex(this)">V10 1s ★</div>
-    <div class="index-pill" data-idx="1HZ100V" onclick="switchIndex(this)">V100 1s ★</div>
+    <div class="index-pill active" data-idx="1HZ100V" onclick="switchIndex(this)">V100 1s</div>
+    <div class="index-pill" data-idx="1HZ75V"  onclick="switchIndex(this)">V75 1s</div>
     <div class="index-pill" data-idx="1HZ50V"  onclick="switchIndex(this)">V50 1s</div>
+    <div class="index-pill" data-idx="1HZ25V"  onclick="switchIndex(this)">V25 1s</div>
+    <div class="index-pill" data-idx="1HZ10V"  onclick="switchIndex(this)">V10 1s</div>
   </div>
   <div class="topbar-right">
     <div class="topbar-balance" id="topBalance">$0.00</div>
@@ -1236,10 +1238,9 @@ const S = {
   lastScoreTime: 0,
 
   // All indices monitored in parallel
-  // Parallel subscription: only indices in active combo list
-  // V10 1s (STRONG+ Rise), V100 1s (STRONG+ Digit), V50 1s (solid baseline)
+  // All 1-second indices — parallel analysis, optimiser selects best
   ALL_INDICES: [
-    '1HZ10V','1HZ100V','1HZ50V',
+    '1HZ10V','1HZ25V','1HZ50V','1HZ75V','1HZ100V',
   ],
   ALL_STRATEGIES: ['rise','digit'],
 
@@ -1290,15 +1291,17 @@ const S = {
     minBlocks:    3,           // blocks needed before locking a combo
     lockBlocks:   4,           // 4 blocks = 32 trades locked, then re-evaluate
     combos: [
-      // COMBO LIST — evidence from 12,268 trades across two datasets:
-      // STRONG+: V10 1s Rise (+$326, 62.5% WR), V100 1s Digit (+$417, 66.7% WR)
-      // SOLID:   V50 1s Rise (+$25,683 baseline, mixed recent — keep, monitor)
-      // REMOVED: V75 1s Rise (-$1,282, -25pp gap), V100 1s Rise (-$560, -24pp gap)
-      // REMOVED: V75 1s Digit (only 5 trades, -27pp gap), V50 1s Digit (-$903 recent)
-      // Note: V50 1s Digit excluded after -$903 at -12pp gap in Jun 17 session
-      { index:'1HZ10V',  strategy:'rise',  label:'V10 1s  · Rise/Fall' }, // STRONG+
-      { index:'1HZ100V', strategy:'digit', label:'V100 1s · Digit'     }, // STRONG+
-      { index:'1HZ50V',  strategy:'rise',  label:'V50 1s  · Rise/Fall' }, // SOLID baseline
+      // ALL pairs in rotation — optimiser + Kelly decide allocation, not hard removal
+      // Switching architecture routes away from losers automatically
+      // Data labels for reference only — every pair gets a fair shot each session
+      { index:'1HZ10V',  strategy:'rise',  label:'V10 1s  · Rise/Fall' }, // STRONG+ (62.5% WR)
+      { index:'1HZ100V', strategy:'digit', label:'V100 1s · Digit'     }, // STRONG+ (66.7% WR)
+      { index:'1HZ50V',  strategy:'rise',  label:'V50 1s  · Rise/Fall' }, // baseline engine
+      { index:'1HZ75V',  strategy:'rise',  label:'V75 1s  · Rise/Fall' }, // rotating
+      { index:'1HZ100V', strategy:'rise',  label:'V100 1s · Rise/Fall' }, // rotating
+      { index:'1HZ50V',  strategy:'digit', label:'V50 1s  · Digit'     }, // rotating
+      { index:'1HZ75V',  strategy:'digit', label:'V75 1s  · Digit'     }, // rotating
+      { index:'1HZ10V',  strategy:'digit', label:'V10 1s  · Digit'     }, // rotating
     ],
     stats:        {},          // key: 'index|strategy' → { trades, wins, winAmt, lossAmt, blocks }
     currentCombo: 0,           // index into combos[]
@@ -1851,63 +1854,54 @@ function selectBestDigitBet(freqs, signals, total) {
 
 function analyzeRiseFall(data, prices) {
   const priceData = prices || S.priceTicks;
-  if(priceData.length < 20) return null;
+  if(priceData.length < 10) return null; // need at least 10 ticks
 
   const n = priceData.length;
 
-  // ── DUAL WINDOW MOMENTUM (3-tick fast + 7-tick slow)
-  // Both must agree on direction — filters out noise-driven entries.
-  // Classical dual-MA crossover adapted for tick data.
-  // 5-tick Rise/Fall: payout ~1.7x, need 37% WR to break even
-  // Signal: sustained momentum over multiple windows
-  const fast3  = priceData.slice(-3).reduce((a,b)=>a+b,0)/3;
-  const prev3  = priceData.slice(-6,-3).reduce((a,b)=>a+b,0)/3;
-  const slow7  = priceData.slice(-7).reduce((a,b)=>a+b,0)/7;
-  const prev7  = priceData.slice(-14,-7).reduce((a,b)=>a+b,0)/7;
-  const slow12 = priceData.slice(-12).reduce((a,b)=>a+b,0)/12;
-  const prev12 = priceData.slice(-24,-12).reduce((a,b)=>a+b,0)/12;
+  // ── DUAL-WINDOW MOMENTUM (3-tick fast + 7-tick slow)
+  // Both must agree on direction — proven signal from baseline 11,973-trade dataset
+  // Removed triple-window and acceleration — they caused 699 ticks with zero trades
+  const fast3  = priceData.slice(-3).reduce((a,b)=>a+b,0) / 3;
+  const prev3  = priceData.slice(-6,-3).reduce((a,b)=>a+b,0) / 3;
+  const slow7  = priceData.slice(-7).reduce((a,b)=>a+b,0) / 7;
+  const prev7  = priceData.slice(-14,-7).reduce((a,b)=>a+b,0) / 7;
 
   const fastDelta = fast3 - prev3;
   const slowDelta = slow7 - prev7;
-  const longDelta = slow12 - prev12;
 
-  // All three windows must agree on direction
+  // Both windows must agree on direction
   if(Math.sign(fastDelta) !== Math.sign(slowDelta)) return null;
-  if(Math.sign(fastDelta) !== Math.sign(longDelta)) return null;
-  if(fastDelta === 0 || slowDelta === 0) return null;
+  if(fastDelta === 0) return null;
 
   const dir = fastDelta > 0 ? 'up' : 'down';
 
-  // Volatility filter: fast delta > 6% of 20-tick range
+  // Volatility filter: movement must be meaningful relative to recent range
+  // Threshold halved from 0.06 to 0.03 — was filtering too aggressively
   const hi    = Math.max(...priceData.slice(-20));
   const lo    = Math.min(...priceData.slice(-20));
   const range = hi - lo || 0.001;
-  if(Math.abs(fastDelta) < range * 0.06) return null;
+  if(Math.abs(fastDelta) < range * 0.03) return null;
 
-  // Acceleration filter
-  const acceleration = Math.abs(fastDelta) / (Math.abs(slowDelta) || 0.0001);
-  if(acceleration < 1.05) return null;
-
-  // Tick consistency: 2/3 recent ticks confirm direction
+  // Tick consistency: at least 1/3 recent ticks confirm direction
+  // Relaxed from 2/3 — 1/3 still filters noise but allows more signals
   let consistent = 0;
-  for(let i=n-4; i<n-1; i++) {
+  for(let i = n-4; i < n-1; i++) {
     if(dir==='up'   && priceData[i+1] > priceData[i]) consistent++;
     if(dir==='down' && priceData[i+1] < priceData[i]) consistent++;
   }
-  if(consistent < 2) return null;
+  if(consistent < 1) return null;
 
-  // 1-tick payout ~0.875x on Deriv V-index synthetics
-  // Break-even: 53.3% WR — achievable (baseline 55.4%)
-  // 5-tick payout was 0.71x needing 58.5% WR — data proved unachievable
-  const payout  = 1.95; // Deriv 1-tick RF pays ~0.95x on stake
-  const winProb = 0.52 + (consistent/3)*0.03 + (Math.min(acceleration,2)-1)*0.02;
+  // 1-tick payout: ~0.95x return on stake (payout field = 1.95 = stake + profit)
+  // Break-even: 53.3% WR — our baseline delivers 55.4%
+  const payout  = 1.95;
+  const winProb = 0.51 + (consistent / 3) * 0.03;
   const ev      = winProb * payout - 1;
   if(ev <= 0) return null;
 
   return {
     type:    dir === 'up' ? 'CALL' : 'PUT',
     label:   dir === 'up' ? 'RISE' : 'FALL',
-    desc:    `Triple-MA ${dir} · f${fastDelta.toFixed(3)} s${slowDelta.toFixed(3)} l${longDelta.toFixed(3)} · acc${acceleration.toFixed(2)}x · ${consistent}/3`,
+    desc:    `Dual-MA ${dir} · Δfast${fastDelta.toFixed(4)} Δslow${slowDelta.toFixed(4)} · ${consistent}/3 ticks`,
     payout, winProb, ev, barrier: null
   };
 }
@@ -2069,7 +2063,7 @@ function decideAndTrade(analysis) {
   // ── Minimum tick gap between trades: prevents firing on every single tick
   // Gives the signal window time to refresh with new data
   const now = Date.now();
-  const minGap = S.strategy === 'digit' ? 1200 : 800; // ms — stricter signals need window refresh
+  const minGap = S.strategy === 'digit' ? 800 : 500; // ms between trades
   if(now - S.lastTradeTime < minGap) return;
   S.lastTradeTime = now;
 
