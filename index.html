@@ -1265,6 +1265,7 @@ const S = {
   // Signal gating
   waitingResult: false,
   openContract: null,
+  settledContracts: null, // Set of contract_ids already settled — prevents double-processing
   pauseTicks: 0,
   skippedSignals: 0,
   gateStats: { escalated:0, held:0, sittingOut:0, recovered:0 },
@@ -1278,7 +1279,8 @@ const S = {
   recoveryTicks: 0,
 
   // ── Regime tracking (from quant analysis)
-  regimeBuffer:    [],    // last 20 trade outcomes for active combo [true/false]
+  regimeBuffer:    [],    // last 10 trade outcomes for active combo [true/false] (UI display)
+  comboRecent:     {},    // PER-COMBO rolling 20-trade profit array — what Kelly actually uses
   regimeWR:        0.5,   // rolling win rate (updated after every trade)
   regimeState:     'neutral', // 'hot' | 'neutral' | 'cold'
   timeFilterActive: false, // true when current hour is a restricted window
@@ -1552,7 +1554,7 @@ function cleanUrl() {
 function handleMsg(msg) {
   const bal = msg?.data?.balance ?? msg?.balance?.balance ?? msg?.balance;
   if(typeof bal === 'number' && !S.connected) { onConnected(bal); return; }
-  if(typeof bal === 'number' && S.connected)  { S.balance = bal; updateBalance(); return; }
+  if(typeof bal === 'number' && S.connected)  { S.balance = bal; updateBalance(); checkPnlDrift(); return; }
   if(msg.msg_type === 'authorize') { onConnected(msg.authorize.balance); return; }
   if(msg.msg_type === 'balance') {
     const realBalance = parseFloat(msg.balance.balance);
@@ -1562,6 +1564,7 @@ function handleMsg(msg) {
       updateBalance();
       computeBaseStake(); // recompute stake from real balance
     }
+    checkPnlDrift();
     return;
   }
 
@@ -1602,21 +1605,53 @@ function handleMsg(msg) {
     S.waitingResult = true;
     S.pendingBet    = null;
     S.pendingReqId  = null;
+    S.settledContracts = S.settledContracts || new Set();
     send({ proposal_open_contract:1, contract_id: S.openContract, subscribe:1 });
     return;
   }
   const cid = msg?.data?.contract_id;
   if(cid && !S.openContract) { S.openContract = cid; S.waitingResult = true; return; }
 
+  // ── SETTLEMENT — hardened against duplicate/stale/mismatched events
+  // Bug found: settlement messages were processed without verifying they
+  // belonged to the CURRENT open contract, and without dedup — causing
+  // phantom P&L that diverged from the real Deriv account.
   if(msg.msg_type === 'proposal_open_contract') {
     const c = msg.proposal_open_contract;
-    if(c.is_expired || c.status === 'sold') { processResult(c); return; }
+    if(c.is_expired || c.status === 'sold') {
+      handleSettlement(c);
+      return;
+    }
   }
-  if(msg?.data?.status === 'sold' || msg?.data?.is_expired) { processResult(msg.data); return; }
+  if(msg?.data?.status === 'sold' || msg?.data?.is_expired) {
+    handleSettlement(msg.data);
+    return;
+  }
 
   const err = msg?.errors?.[0]?.message || msg?.error?.message;
   if(err) { showNotif('Deriv: ' + err, 'error'); S.waitingResult = false; }
   if(!S.connected) { fetchBalanceFallback(); }
+}
+
+// ── DRIFT DETECTOR — catches the exact bug that caused +$8,710 (logged)
+// vs real account showing -$5,000+. Compares real balance movement
+// against the bot's internal session P&L counter; alerts loudly if they diverge.
+function checkPnlDrift() {
+  if(S.sessionStartBalance <= 0) return;
+  const realSessionPnl = S.balance - S.sessionStartBalance;
+  const loggedSessionPnl = S.totalPnl;
+  const drift = Math.abs(realSessionPnl - loggedSessionPnl);
+
+  // Allow small drift from in-flight unsettled trades, flag anything material
+  if(drift > Math.max(5, S.baseStake * 2)) {
+    const banner = document.getElementById('slBanner');
+    banner.textContent = `⚠ P&L MISMATCH DETECTED: Bot log says ${loggedSessionPnl>=0?'+':''}$${loggedSessionPnl.toFixed(2)} but real balance moved ${realSessionPnl>=0?'+':''}$${realSessionPnl.toFixed(2)} (drift $${drift.toFixed(2)}). Stopping bot — investigate before continuing.`;
+    banner.classList.add('show');
+    if(S.running) {
+      stopBot();
+      showNotif(`⚠ P&L drift $${drift.toFixed(2)} detected — bot stopped for safety`, 'error');
+    }
+  }
 }
 
 function onConnected(bal) {
@@ -1914,53 +1949,48 @@ function computeKellyStake() {
   const key   = `${S.index}|${S.strategy}`;
   const stats = S.optimiser.stats[key];
 
-  // Exploration phase: < 10 trades on this combo → half stake
-  if(!stats || stats.trades < 10) {
+  // ── PER-COMBO RECENT WINDOW (fixes stale-data bug)
+  // Bug found: V25 1s Rise had old lifetime stats from a prior session,
+  // so Kelly treated it as "proven" and full-staked it — then it went
+  // 2/15 in this session's actual conditions. Lifetime stats can lie.
+  // Fix: track last 20 trades PER COMBO, scale off THAT, not lifetime totals.
+  if(!S.comboRecent) S.comboRecent = {};
+  if(!S.comboRecent[key]) S.comboRecent[key] = [];
+  const recent = S.comboRecent[key];
+
+  // Not enough recent data on THIS combo in THIS session → exploration stake
+  if(recent.length < 8) {
     return Math.max(0.35, +(S.baseStake * 0.5).toFixed(2));
   }
 
-  // ── MOMENTUM-GATED KELLY (from quant analysis)
-  // Trailing 10-trade regime WR drives stake multiplier.
-  // Evidence: +0.32 lag-1 autocorrelation — momentum persists.
-  // Regime states:
-  //   HOT    (WR > 65%): peak hours (08-09, 20-22 GMT) yield 64-69% WR → scale up
-  //   WARM   (WR 55-65%): normal positive regime → base × 1.3
-  //   NEUTRAL(WR 45-55%): no clear edge → base stake
-  //   COLD   (WR < 45%): regime has flipped → base × 0.5 (stay in game, minimal exposure)
-  const momentumWR = S.regimeWR;
+  // Recent performance (last up to 20 trades on this exact combo)
+  const recentWins  = recent.filter(p => p > 0);
+  const recentLosses= recent.filter(p => p < 0).map(p => Math.abs(p));
+  const recentWR    = recentWins.length / recent.length;
+  const recentAvgW  = recentWins.length   ? recentWins.reduce((a,b)=>a+b,0)/recentWins.length     : 0;
+  const recentAvgL  = recentLosses.length ? recentLosses.reduce((a,b)=>a+b,0)/recentLosses.length : 0;
+  const recentBE    = (recentAvgW+recentAvgL) > 0 ? recentAvgL/(recentAvgW+recentAvgL) : 0.5;
+  const recentEdge  = recentWR - recentBE;
+
+  // ── REGIME CLASSIFICATION — now driven by THIS combo's recent results
   let scale;
-  if(momentumWR >= 0.65) {
-    scale = tier.maxScale;        // hot — maximise
-    S.regimeState = 'hot';
-  } else if(momentumWR >= 0.55) {
-    scale = Math.min(1.3, tier.maxScale); // warm — above base
-    S.regimeState = 'warm';
-  } else if(momentumWR >= 0.45) {
-    scale = 1.0;                  // neutral — base
-    S.regimeState = 'neutral';
+  if(recentEdge > 0.12) {
+    scale = tier.maxScale; S.regimeState = 'hot';
+  } else if(recentEdge > 0.03) {
+    scale = Math.min(1.3, tier.maxScale); S.regimeState = 'warm';
+  } else if(recentEdge > -0.05) {
+    scale = 1.0; S.regimeState = 'neutral';
   } else {
-    scale = tier.minScale;        // cold — protect capital
-    S.regimeState = 'cold';
+    // Negative recent edge on THIS combo — this is what V25 needed and didn't get
+    scale = tier.minScale; S.regimeState = 'cold';
   }
 
-  // Additionally apply classic quarter-Kelly as a floor check
-  // Full Kelly = 4.38% (measured across dataset). Quarter = 1.09%.
-  const n    = stats.trades;
-  const wr   = stats.wins / n;
-  const avgW = stats.wins > 0       ? stats.winAmt  / stats.wins          : 0;
-  const avgL = (n - stats.wins) > 0 ? stats.lossAmt / (n - stats.wins)    : 0;
-  if(avgW > 0 && avgL > 0) {
-    const be      = avgL / (avgW + avgL);
-    const edge    = wr - be;
-    if(edge > 0) {
-      const rawKelly  = (edge * avgW / avgL) / avgW;
-      const qKelly    = rawKelly * 0.25; // quarter-Kelly fraction
-      // Kelly says max X% of balance — use as a cap, not a floor
-      const kellyCap  = +(S.balance * Math.min(qKelly, 0.04)).toFixed(2);
-      const stakePct  = +(S.baseStake * scale).toFixed(2);
-      const hardCap   = +(S.balance * 0.03).toFixed(2);
-      return Math.max(0.35, Math.min(stakePct, hardCap, kellyCap > 0.35 ? hardCap : hardCap));
-    }
+  // Hard kill: if last 5 trades on this combo are 4+ losses, force minimum stake
+  // regardless of older history — this is the direct fix for the V25 burst losses
+  const last5 = recent.slice(-5);
+  const last5Losses = last5.filter(p => p < 0).length;
+  if(last5.length === 5 && last5Losses >= 4) {
+    scale = tier.minScale * 0.5; // even more conservative than normal cold
   }
 
   const stake = +(S.baseStake * scale).toFixed(2);
@@ -1968,11 +1998,18 @@ function computeKellyStake() {
   return Math.max(0.35, Math.min(stake, cap));
 }
 
-// Update regime buffer after every trade result
-function updateRegime(won) {
+// Update regime buffer (global, for UI display) + per-combo recent window (for Kelly)
+function updateRegime(won, profit) {
   S.regimeBuffer.push(won);
-  if(S.regimeBuffer.length > 10) S.regimeBuffer.shift(); // rolling 10-trade window
+  if(S.regimeBuffer.length > 10) S.regimeBuffer.shift();
   S.regimeWR = S.regimeBuffer.filter(Boolean).length / S.regimeBuffer.length;
+
+  // Per-combo recent window — this is what Kelly actually uses now
+  const key = `${S.index}|${S.strategy}`;
+  if(!S.comboRecent) S.comboRecent = {};
+  if(!S.comboRecent[key]) S.comboRecent[key] = [];
+  S.comboRecent[key].push(profit);
+  if(S.comboRecent[key].length > 20) S.comboRecent[key].shift(); // rolling 20-trade window
 }
 
 // ─────────────────────────────────────────────────────
@@ -2163,8 +2200,33 @@ function executeTrade(bet) {
 // ─────────────────────────────────────────────────────
 // RESULT PROCESSING
 // ─────────────────────────────────────────────────────
+function handleSettlement(contract) {
+  const incomingId = contract.contract_id;
+
+  // GUARD 1: must match the contract we are actually waiting on
+  if(!S.waitingResult || !S.openContract) return;
+  if(incomingId && incomingId != S.openContract) {
+    // Stale/mismatched settlement for a contract we already closed — ignore
+    console.warn('Ignored mismatched settlement', incomingId, 'expected', S.openContract);
+    return;
+  }
+
+  // GUARD 2: dedupe — never process the same contract_id twice
+  S.settledContracts = S.settledContracts || new Set();
+  if(incomingId && S.settledContracts.has(incomingId)) {
+    console.warn('Ignored duplicate settlement', incomingId);
+    return;
+  }
+  if(incomingId) S.settledContracts.add(incomingId);
+
+  // GUARD 3: explicitly cancel this contract's subscription so Deriv
+  // stops sending further updates that could be mis-routed to the next trade
+  if(incomingId) send({ forget_all: 'proposal_open_contract' });
+
+  processResult(contract);
+}
+
 function processResult(contract) {
-  if(!S.waitingResult) return;
   S.waitingResult = false;
   S.openContract = null;
   document.getElementById('activeBetBanner').classList.remove('show');
@@ -2204,7 +2266,7 @@ function processResult(contract) {
     showNotif(`❌ LOSS -$${Math.abs(profit).toFixed(2)}`, 'error');
   }
 
-  updateRegime(win);           // update momentum regime (quant analysis change)
+  updateRegime(win, profit);   // update momentum regime + per-combo recent window
   addToLog(win, profit, ctype, contract.barrier);
   optRecordTrade(win, profit); // feed optimiser
 
@@ -2810,7 +2872,9 @@ function resetSession() {
   S.skippedSignals=0; S.pauseTicks=0;
   S.gateStats = { escalated:0, held:0, sittingOut:0, recovered:0 };
   S.waitingResult=false; S.openContract=null; S.lastTradeTime=0; S.recoveryPendingLevel=0; S.recoveryTicks=0;
+  S.settledContracts = new Set(); // clear dedup set on session reset
   S.regimeBuffer=[]; S.regimeWR=0.5; S.regimeState='neutral'; S.timeFilterActive=false;
+  S.comboRecent={}; // full session reset clears per-combo recent memory too
   if(S.optimiser.enabled) {
     S.optimiser.blockTrades = 0;
     // Keep stats across resets so data accumulates
