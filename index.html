@@ -312,7 +312,7 @@ body::before {
 .se-mlbl { font-family:var(--font-m); font-size:8px; letter-spacing:1px; color:var(--text2); margin-bottom:3px; }
 .se-mval { font-family:var(--font-m); font-size:13px; font-weight:600; }
 
-/* MARTINGALE STATE OKAY */
+/* MARTINGALE STATE */
 .mart-state {
   background:var(--bg2); border:1px solid var(--border2); border-radius:var(--r2);
   padding:16px; position:relative;
@@ -2202,7 +2202,10 @@ function maybeEnterPosition(index, strategy) {
   if(S.openPositions.has(comboKey)) return;   // already holding a position here
   if(S.pendingCombos.has(comboKey)) return;   // proposal/buy already in flight here
 
-  if(Date.now() < (S.comboCooldownUntil[comboKey] || 0)) return; // this combo is cooling down
+  // Brief slow-down gap (3s) is applied below when in a loss streak.
+  // No combo is ever fully stopped via this cooldown check — the
+  // 'effectively infinite' pause approach was removed because it
+  // deadlocked: paused combos could never win to unpause themselves.
 
   const minGap = strategy === 'digit' ? 800 : 500;
   if(Date.now() - (S.comboLastTradeTime[comboKey] || 0) < minGap) return;
@@ -2216,24 +2219,21 @@ function maybeEnterPosition(index, strategy) {
     if(regime.state !== 'hot') return;
   }
 
-  // ── PER-COMBO LOSS STREAK → SIGNAL-GATED PAUSE
-  // Data (953 trades): pause-on-2 simulation converts -$1,814 net to
-  // +$800 by skipping just 57 trades. Key insight: losses cluster on
-  // synthetic indices (L→L rate 35-63% per combo) so pausing after 2
-  // consecutive losses and waiting for the next positive signal —
-  // rather than a fixed timer — avoids the worst of each cluster.
+  // ── PER-COMBO LOSS STREAK → STAKE REDUCTION (not a full pause)
+  // No combo is ever stopped — that would be dropping a pair, which is
+  // against the core design rule. Instead, after 2 consecutive losses
+  // the combo keeps trading but computeKellyStake() will already return
+  // minScale (cold regime) from the recent-window logic. We add a brief
+  // 3s inter-trade gap here (replacing the normal minGap) to slow the
+  // fire rate slightly during a bad run without killing it entirely.
+  // Recovery is automatic — when wins return, Kelly scales back up.
   const regime = getComboRegime(index, strategy);
-  const PAUSE_THRESHOLD = 2; // consecutive losses before pausing this combo
-  if((S.comboLossStreak[comboKey] || 0) >= PAUSE_THRESHOLD) {
-    // Don't clear the streak counter yet — only clear it when we see an
-    // actual positive signal on this combo, confirming conditions shifted.
-    // This IS different from the timer-based 20s cooldown — a timer can
-    // expire while the market is still unfavourable; a signal gate waits
-    // for evidence of recovery before re-entering.
-    S.comboCooldownUntil[comboKey] = Date.now() + 999999999; // effectively infinite
-    // (cleared in handleSettlement when this combo wins)
-    showNotif(`⏸ ${index} · ${strategy} paused after ${S.comboLossStreak[comboKey]} losses — waiting for positive signal`, 'info');
-    return;
+  const lossStreak = S.comboLossStreak[comboKey] || 0;
+  if(lossStreak >= 2) {
+    // 3-second minimum between trades on this combo when in a losing run
+    // (vs the normal 0.5s–0.8s). All other combos are completely unaffected.
+    const slowGap = 3000;
+    if(Date.now() - (S.comboLastTradeTime[comboKey] || 0) < slowGap) return;
   }
 
   // ── SIGNAL CHECK — this combo's own bet, independent of every other combo
@@ -2390,7 +2390,7 @@ function handleSettlement(contract) {
     if(win) {
       // Win: clear loss streak AND release pause — positive signal confirmed
       S.comboLossStreak[comboKey] = 0;
-      S.comboCooldownUntil[comboKey] = 0; // unpause this combo
+      S.comboCooldownUntil[comboKey] = 0; // reset any brief slow-down timer on win
       // Track win streak for Kelly scaling
       if(!S.comboWinStreak) S.comboWinStreak = {};
       S.comboWinStreak[comboKey] = (S.comboWinStreak[comboKey] || 0) + 1;
