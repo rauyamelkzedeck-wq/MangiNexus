@@ -1275,6 +1275,8 @@ const S = {
   openContract: null,
   settledContracts: null, // Set of contract_ids already settled — prevents double-processing
   boughtContracts:  null, // Set of EVERY contract_id ever bought — guarantees no real money goes untracked
+  contractSubId:    null, // Map<contractId, subscriptionId> — lets us properly forget() each subscription on settlement
+  contractBoughtAt: null, // Map<contractId, timestamp> — feeds the poll-based safety sweep
 
   // ── CONCURRENT MULTI-COMBO EXECUTION
   // No cap on simultaneous open positions (explicit choice) — every pair/strategy
@@ -1658,23 +1660,37 @@ function handleMsg(msg) {
     renderOpenPositions();
     send({ proposal_open_contract:1, contract_id: newContractId, subscribe:1 });
 
-    // WATCHDOG: if this contract's settlement never arrives, proactively
-    // re-subscribe after 25s rather than silently losing track of real money.
+    // Track when this contract was bought so the poll-based safety
+    // sweep (below) knows when it's overdue for a settlement check.
+    S.contractBoughtAt = S.contractBoughtAt || new Map();
+    S.contractBoughtAt.set(newContractId, Date.now());
+
+    // WATCHDOG: if this contract's settlement never arrives via the push
+    // subscription, proactively re-subscribe after 8s. 1-tick contracts
+    // settle in low single-digit seconds, so 8s is already a generous
+    // margin — shortened from 25s now that concurrent volume makes a
+    // missed settlement more consequential the longer it goes unnoticed.
     setTimeout(() => {
       if(!S.settledContracts.has(newContractId)) {
-        console.warn('Watchdog: no settlement for', newContractId, 'after 25s — resubscribing');
+        console.warn('Watchdog: no settlement for', newContractId, 'after 8s — resubscribing');
         send({ proposal_open_contract:1, contract_id: newContractId, subscribe:1 });
       }
-    }, 25000);
+    }, 8000);
     return;
   }
 
-  // ── SETTLEMENT — hardened against duplicate/stale/mismatched events
-  // Bug found: settlement messages were processed without verifying they
-  // belonged to the CURRENT open contract, and without dedup — causing
-  // phantom P&L that diverged from the real Deriv account.
+  // ── SETTLEMENT — hardened against duplicate/stale/mismatched events,
+  // AND against unbounded subscription growth (the actual cause of the
+  // most recent drift: concurrent trading left every contract's
+  // subscription open forever, eventually starving newer subscribes).
   if(msg.msg_type === 'proposal_open_contract') {
     const c = msg.proposal_open_contract;
+    // Capture Deriv's subscription id the moment we see it, regardless
+    // of settlement state, so we can release it precisely once done.
+    if(msg.subscription?.id && c.contract_id) {
+      S.contractSubId = S.contractSubId || new Map();
+      S.contractSubId.set(c.contract_id, msg.subscription.id);
+    }
     if(c.is_expired || c.status === 'sold') {
       handleSettlement(c);
       return;
@@ -1688,14 +1704,22 @@ function handleMsg(msg) {
   const err = msg?.errors?.[0]?.message || msg?.error?.message;
   if(err) {
     showNotif('Deriv: ' + err, 'error');
-    // Under the per-combo architecture there is no single global lock to
-    // release here — each combo's proposal/buy flow handles its own
-    // errors independently (see the 'proposal' handler above), and every
-    // bought contract is tracked individually via S.openPositions until
-    // its own matching settlement or watchdog resolves it. A generic,
-    // unattributed error message must never clear state for a position
-    // it isn't actually about — so this handler only logs and notifies.
-    console.warn('Unattributed Deriv error (no action taken on open positions):', err);
+    // A failed BUY (price moved, edge-case rejection, etc.) doesn't move
+    // any money — but if we don't release that combo's pending lock, it
+    // gets stuck "in flight" forever and silently stops trading for the
+    // rest of the session. Errors echo back req_id, so we can clean up
+    // precisely the right combo without touching anything else's state.
+    const errReqId = msg?.echo_req?.req_id;
+    if(errReqId !== undefined && S.pendingProposals?.has(errReqId)) {
+      const stuck = S.pendingProposals.get(errReqId);
+      const stuckKey = `${stuck.index}|${stuck.strategy}`;
+      S.pendingProposals.delete(errReqId);
+      S.pendingCombos?.delete(stuckKey);
+      renderOpenPositions();
+      console.warn('Released stuck combo after buy error:', stuckKey, err);
+    } else {
+      console.warn('Unattributed Deriv error (no matching pending combo):', err);
+    }
   }
   if(!S.connected) { fetchBalanceFallback(); }
 }
@@ -1730,6 +1754,7 @@ function onConnected(bal) {
   S.openPositions = new Map(); S.contractToCombo = new Map();
   S.pendingProposals = new Map(); S.pendingCombos = new Set();
   S.settledContracts = new Set(); S.boughtContracts = new Set();
+  S.contractSubId = new Map(); S.contractBoughtAt = new Map();
   setConnDot('live','LIVE');
   document.getElementById('connectOverlay').style.display = 'none';
   document.getElementById('topBalance').style.display = 'block';
@@ -2346,7 +2371,37 @@ function handleSettlement(contract) {
       showNotif(`⚠ Recovered orphaned contract ${incomingId} — P&L corrected`, 'warn');
     }
   }
+
+  // ── RELEASE the subscription now that we're done with this contract.
+  // This is the actual fix for the latest drift: subscriptions were
+  // never released, accumulating unbounded across the session until
+  // newer ones presumably started failing silently under concurrent load.
+  if(incomingId && S.contractSubId?.has(incomingId)) {
+    send({ forget: S.contractSubId.get(incomingId) });
+    S.contractSubId.delete(incomingId);
+  }
+  S.contractBoughtAt?.delete(incomingId);
 }
+
+// ── POLL-BASED SAFETY SWEEP — independent of whether the push
+// subscription above is working at all. Every 5s, directly re-query
+// any contract that's been open longer than 4s (1-tick contracts settle
+// in low single digits of seconds, so anything older is overdue). This
+// closes the gap even if the subscription-cleanup fix isn't the full
+// story — no open position can silently sit unmonitored for long.
+setInterval(() => {
+  if(!S.connected || !S.openPositions || S.openPositions.size === 0) return;
+  S.contractBoughtAt = S.contractBoughtAt || new Map();
+  const now = Date.now();
+  S.openPositions.forEach((pos) => {
+    const boughtAt = S.contractBoughtAt.get(pos.contractId) || pos.boughtAt;
+    if(now - boughtAt > 4000 && !S.settledContracts?.has(pos.contractId)) {
+      // One-time (non-subscribe) status check — forces Deriv to tell us
+      // the current state regardless of whether the push channel is alive
+      send({ proposal_open_contract: 1, contract_id: pos.contractId });
+    }
+  });
+}, 5000);
 
 function recordContractOutcome(contract, isActiveTrade, index, strategy) {
   const profit = parseFloat(contract.profit) || 0;
@@ -2988,9 +3043,12 @@ function resetSession() {
   document.getElementById('tradeLog').innerHTML = '<div style="padding:20px;text-align:center;font-family:var(--font-m);font-size:10px;color:var(--text2)">No trades yet.<br>Start the bot.</div>';
   document.getElementById('tlCount').textContent = '0 trades';
   document.getElementById('slBanner').classList.remove('show');
+  // Release any subscriptions still open before wiping the tracking maps
+  if(S.contractSubId) { S.contractSubId.forEach(subId => send({ forget: subId })); }
   S.openPositions = new Map(); S.contractToCombo = new Map();
   S.pendingProposals = new Map(); S.pendingCombos = new Set();
   S.comboLastTradeTime = {}; S.comboLossStreak = {}; S.comboCooldownUntil = {};
+  S.contractSubId = new Map(); S.contractBoughtAt = new Map();
   renderOpenPositions();
   document.getElementById('pauseBadge').classList.remove('show');
   computeBaseStake();
