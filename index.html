@@ -390,19 +390,30 @@ body::before {
 .tick-cell.flash { animation:tickFlash .5s ease; }
 @keyframes tickFlash { 0%{transform:scale(1.4);} 100%{transform:scale(1);} }
 
-/* ACTIVE BET BANNER */
-.active-bet-banner {
+/* OPEN POSITIONS — multiple concurrent combos */
+.open-positions-panel {
   grid-column:1/-1;
-  background:linear-gradient(135deg, rgba(201,168,76,.08), rgba(0,212,200,.05));
-  border:1px solid rgba(201,168,76,.25); border-radius:var(--r2);
+  background:var(--bg2); border:1px solid var(--border2); border-radius:var(--r2);
   padding:12px 16px;
-  display:none; animation:fadeSlide .3s ease;
 }
-.active-bet-banner.show { display:flex; }
+.op-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
+.op-title { font-family:var(--font-m); font-size:9px; letter-spacing:3px; color:var(--gold); text-transform:uppercase; }
+.op-count { font-family:var(--font-m); font-size:9px; color:var(--text2); }
+.op-empty { font-family:var(--font-m); font-size:10px; color:var(--text2); padding:8px 0; }
+.op-row {
+  display:grid; grid-template-columns:1fr auto auto auto; gap:12px; align-items:center;
+  padding:8px 10px; border-radius:var(--r); background:var(--bg3);
+  border:1px solid rgba(201,168,76,.2); margin-bottom:5px;
+  animation:fadeSlide .25s ease;
+}
+.op-row.pending { border-color:rgba(0,212,200,.25); opacity:.7; }
+.op-combo { font-family:var(--font-d); font-size:12px; font-weight:700; color:var(--gold); }
+.op-row.pending .op-combo { color:var(--teal); }
+.op-desc { font-family:var(--font-m); font-size:9px; color:var(--text1); margin-top:1px; }
+.op-stake { font-family:var(--font-m); font-size:12px; font-weight:600; color:var(--text0); text-align:right; }
+.op-meta { font-family:var(--font-m); font-size:9px; color:var(--text2); text-align:right; }
+.op-elapsed { font-family:var(--font-m); font-size:9px; color:var(--text2); text-align:right; min-width:36px; }
 @keyframes fadeSlide { from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none} }
-.abb-left { flex:1; }
-.abb-type { font-family:var(--font-d); font-size:14px; font-weight:700; letter-spacing:2px; color:var(--gold); }
-.abb-desc { font-family:var(--font-m); font-size:10px; color:var(--text1); margin-top:2px; }
 .abb-right { text-align:right; }
 .abb-stake { font-family:var(--font-m); font-size:18px; font-weight:600; color:var(--text0); }
 .abb-meta { font-family:var(--font-m); font-size:9px; color:var(--text2); margin-top:2px; }
@@ -719,7 +730,7 @@ canvas { display:block; width:100%; }
       transition:all .2s;text-transform:uppercase;
     ">⚡ AUTO</button>
     <div class="strat-sub" id="stratDesc">
-      RISE/FALL: 5-tick momentum. +2.55pp confirmed edge. Default strategy.
+      RISE/FALL: 1-tick dual-MA momentum. Now trades ALL pairs concurrently.
     </div>
   </div>
 
@@ -922,16 +933,13 @@ canvas { display:block; width:100%; }
             </div>
           </div>
 
-          <!-- Active Bet Banner -->
-          <div class="active-bet-banner" id="activeBetBanner">
-            <div class="abb-left">
-              <div class="abb-type" id="abbType">DIGITOVER 7</div>
-              <div class="abb-desc" id="abbDesc">Digit must be greater than 7</div>
+          <!-- Open Positions — multiple combos can be live at once -->
+          <div class="open-positions-panel" id="openPositionsPanel">
+            <div class="op-header">
+              <div class="op-title">// Open Positions</div>
+              <div class="op-count" id="opCount">0 open</div>
             </div>
-            <div class="abb-right">
-              <div class="abb-stake" id="abbStake">$0.35</div>
-              <div class="abb-meta" id="abbMeta">Level 0 · Payout 2.1x</div>
-            </div>
+            <div id="openPositionsList" class="op-empty">No open positions — scanning all pairs for signals...</div>
           </div>
 
           <!-- Digit Frequency -->
@@ -1266,6 +1274,21 @@ const S = {
   waitingResult: false,
   openContract: null,
   settledContracts: null, // Set of contract_ids already settled — prevents double-processing
+  boughtContracts:  null, // Set of EVERY contract_id ever bought — guarantees no real money goes untracked
+
+  // ── CONCURRENT MULTI-COMBO EXECUTION
+  // No cap on simultaneous open positions (explicit choice) — every pair/strategy
+  // combo with a positive signal can hold an open position at the same time.
+  // Each combo is tracked completely independently to avoid the exact class of
+  // bug (single shared contract state) that caused the earlier P&L drift.
+  openPositions:     null, // Map<comboKey, {contractId, index, strategy, bet, stake, boughtAt}>
+  contractToCombo:   null, // Map<contractId, comboKey> — O(1) settlement routing
+  pendingProposals:  null, // Map<reqId, {index, strategy, bet, stake}> — in-flight proposals
+  pendingCombos:     null, // Set<comboKey> — combos with a proposal/buy in flight (not yet open)
+  comboLastTradeTime:{},   // {comboKey: timestamp} — per-combo minimum trade gap
+  comboLossStreak:   {},   // {comboKey: count} — per-combo consecutive losses
+  comboCooldownUntil:{},   // {comboKey: timestamp} — per-combo pause after a bad streak
+  reqIdCounter:      0,    // monotonic counter — avoids req_id collisions across concurrent combos
   pauseTicks: 0,
   skippedSignals: 0,
   gateStats: { escalated:0, held:0, sittingOut:0, recovered:0 },
@@ -1577,40 +1600,74 @@ function handleMsg(msg) {
   const tickSym = msg?.data?.symbol ?? msg?.tick?.symbol ?? S.index;
   if(quote !== undefined) { processTick(parseFloat(quote), tickSym); return; }
 
-  // Proposal response — validate req_id, then buy immediately
+  // Proposal response — look up by req_id in the pending-proposals Map.
+  // Multiple proposals (one per combo) can be in flight simultaneously.
   if(msg.msg_type === 'proposal') {
-    // Ignore stale proposals from a previous cycle
-    if(msg.echo_req?.req_id !== S.pendingReqId) return;
+    const reqId  = msg.echo_req?.req_id;
+    S.pendingProposals = S.pendingProposals || new Map();
+    const pending = S.pendingProposals.get(reqId);
+    if(!pending) return; // stale or unknown — ignore
+
+    const comboKey = `${pending.index}|${pending.strategy}`;
 
     if(msg.error) {
       const errMsg = msg.error.message || 'Proposal rejected by Deriv';
-      showNotif('⚠ ' + errMsg, 'error');
-      S.waitingResult = false; S.pendingBet = null; S.pendingReqId = null;
-      document.getElementById('activeBetBanner').classList.remove('show');
+      showNotif(`⚠ ${comboKey}: ${errMsg}`, 'error');
+      S.pendingProposals.delete(reqId);
+      S.pendingCombos?.delete(comboKey);
+      renderOpenPositions();
       return;
     }
 
-    if(msg.proposal?.id && S.pendingBet && S.waitingResult) {
-      // Use ask_price from proposal as the buy price (prevents price mismatch rejection)
-      // ask_price is what Deriv will actually charge — must be >= our stake
-      const askPrice = parseFloat(msg.proposal.ask_price) || S.currentStake;
-      // buy ID must be a string per schema
-      send({ buy: String(msg.proposal.id), price: askPrice, subscribe: 1 });
+    if(msg.proposal?.id) {
+      const askPrice = parseFloat(msg.proposal.ask_price) || pending.stake;
+      // Tag the buy with the SAME req_id so the confirmation can be matched
+      // back to exactly which combo this contract belongs to
+      send({ buy: String(msg.proposal.id), price: askPrice, subscribe: 1, req_id: reqId });
     }
     return;
   }
 
   if(msg.msg_type === 'buy' && msg.buy) {
-    S.openContract  = msg.buy.contract_id;
-    S.waitingResult = true;
-    S.pendingBet    = null;
-    S.pendingReqId  = null;
+    const newContractId = msg.buy.contract_id;
+    const reqId = msg.echo_req?.req_id;
+    S.pendingProposals = S.pendingProposals || new Map();
+    const pending = S.pendingProposals.get(reqId);
+
     S.settledContracts = S.settledContracts || new Set();
-    send({ proposal_open_contract:1, contract_id: S.openContract, subscribe:1 });
+    S.boughtContracts  = S.boughtContracts  || new Set();
+    S.openPositions     = S.openPositions     || new Map();
+    S.contractToCombo   = S.contractToCombo   || new Map();
+    S.boughtContracts.add(newContractId); // permanent record: real money was committed here
+
+    if(pending) {
+      const comboKey = `${pending.index}|${pending.strategy}`;
+      S.openPositions.set(comboKey, {
+        contractId: newContractId, index: pending.index, strategy: pending.strategy,
+        bet: pending.bet, stake: pending.stake, boughtAt: Date.now()
+      });
+      S.contractToCombo.set(newContractId, comboKey);
+      S.pendingProposals.delete(reqId);
+      S.pendingCombos?.delete(comboKey);
+    } else {
+      // No matching pending proposal (shouldn't normally happen) — still
+      // track the contract so its settlement is never silently lost
+      console.warn('Buy confirmation with no matching pending proposal:', newContractId);
+    }
+
+    renderOpenPositions();
+    send({ proposal_open_contract:1, contract_id: newContractId, subscribe:1 });
+
+    // WATCHDOG: if this contract's settlement never arrives, proactively
+    // re-subscribe after 25s rather than silently losing track of real money.
+    setTimeout(() => {
+      if(!S.settledContracts.has(newContractId)) {
+        console.warn('Watchdog: no settlement for', newContractId, 'after 25s — resubscribing');
+        send({ proposal_open_contract:1, contract_id: newContractId, subscribe:1 });
+      }
+    }, 25000);
     return;
   }
-  const cid = msg?.data?.contract_id;
-  if(cid && !S.openContract) { S.openContract = cid; S.waitingResult = true; return; }
 
   // ── SETTLEMENT — hardened against duplicate/stale/mismatched events
   // Bug found: settlement messages were processed without verifying they
@@ -1629,7 +1686,17 @@ function handleMsg(msg) {
   }
 
   const err = msg?.errors?.[0]?.message || msg?.error?.message;
-  if(err) { showNotif('Deriv: ' + err, 'error'); S.waitingResult = false; }
+  if(err) {
+    showNotif('Deriv: ' + err, 'error');
+    // Under the per-combo architecture there is no single global lock to
+    // release here — each combo's proposal/buy flow handles its own
+    // errors independently (see the 'proposal' handler above), and every
+    // bought contract is tracked individually via S.openPositions until
+    // its own matching settlement or watchdog resolves it. A generic,
+    // unattributed error message must never clear state for a position
+    // it isn't actually about — so this handler only logs and notifies.
+    console.warn('Unattributed Deriv error (no action taken on open positions):', err);
+  }
   if(!S.connected) { fetchBalanceFallback(); }
 }
 
@@ -1660,6 +1727,9 @@ function onConnected(bal) {
   S.startBalance = S.balance;
   S.dayStart = S.balance;
   S.peakBalance = S.balance;
+  S.openPositions = new Map(); S.contractToCombo = new Map();
+  S.pendingProposals = new Map(); S.pendingCombos = new Set();
+  S.settledContracts = new Set(); S.boughtContracts = new Set();
   setConnDot('live','LIVE');
   document.getElementById('connectOverlay').style.display = 'none';
   document.getElementById('topBalance').style.display = 'block';
@@ -1739,20 +1809,30 @@ function processTick(price, symbol) {
     updateGauges();
     updateHeatmapData();
     if(S.totalTicks % win === 0) captureHeatmapWindow();
+
+    // Refresh the focused combo's live Kelly/regime display — read-only,
+    // does not trigger any trade. Keeps the Martingale/Kelly panel and
+    // "Current Stake" honest now that real stakes are computed per-combo
+    // independently inside maybeEnterPosition(), not written to a single
+    // global S.currentStake by the (now non-existent) single trade gate.
+    refreshFocusedComboDisplay(sym, S.strategy, analysis);
   }
 
-  // Trigger scoring pass (throttled to once per 600ms)
+  // Trigger scoring pass (throttled to once per 600ms) — still used for
+  // the Live Scores / Optimiser panels and for the optimiser's own
+  // deliberate exploration pacing
   const now = Date.now();
   if(now - S.lastScoreTime > 600) {
     S.lastScoreTime = now;
     runScoringPass();
   }
 
-  // Execute trade decision on active combo
-  // Trade decisions only on active index tick — no pause system, only switching
-  if(S.running && !S.waitingResult && sym === S.index) {
-    const analysis = S.lastAnalysis || analyzeDigitsFor(sym);
-    decideAndTrade(analysis);
+  // ── CONCURRENT EXECUTION: every tick checks BOTH strategies on the
+  // index that just ticked, completely independent of every other combo.
+  // No global lock — any number of combos can hold positions at once.
+  if(S.running) {
+    maybeEnterPosition(sym, 'rise');
+    maybeEnterPosition(sym, 'digit');
   }
 }
 
@@ -1798,19 +1878,25 @@ function _analyzeDigitsData(data, prices, sym) {
   freqs.forEach((f, d) => { if(f <= threshold) signals.push({ digit:d, freq:f, count:counts[d] }); });
   signals.sort((a,b) => a.freq - b.freq);
 
-  // Best EV bet
-  // For scoring pass: evaluate BOTH strategies for this index
-  const digitBet = selectBestDigitBet(freqs, signals, total);
+  // Evaluate BOTH strategies for this index — every combo decides independently now
+  const digitBet = selectBestDigitBet(freqs, signals, total, sym);
   const riseBet  = analyzeRiseFall(data, prices);
+  // bestBet kept for UI/legacy display purposes only (follows whichever strategy
+  // is currently focused in the Signal Engine panel) — NOT used for execution anymore
   const bestBet  = S.strategy === 'digit' ? digitBet : (riseBet || digitBet);
-  // Store both for scoring
-  const _digitBet = digitBet;
-  const _riseBet  = riseBet;
 
-  return { freqs, counts, chi, signals, total, bestBet, sigStrength, threshold };
+  return { freqs, counts, chi, signals, total, bestBet, digitBet, riseBet, sigStrength, threshold };
 }
 
-function selectBestDigitBet(freqs, signals, total) {
+// Returns the bet for a SPECIFIC strategy on a SPECIFIC combo, independent of
+// whatever is globally focused in the UI. This is what concurrent execution uses.
+function getBetForCombo(index, strategy) {
+  const analysis = analyzeDigitsFor(index);
+  if(!analysis) return null;
+  return strategy === 'digit' ? analysis.digitBet : analysis.riseBet;
+}
+
+function selectBestDigitBet(freqs, signals, total, sym) {
   if(total < 50) return null;
 
   const candidates = [];
@@ -1819,7 +1905,9 @@ function selectBestDigitBet(freqs, signals, total) {
   // ── SUSTAINED BIAS CHECK
   // Require bias visible in BOTH short window (freqs) AND the store's full history
   // Prevents trading on short-window noise that disappears in next window
-  const store = S.indexData[S.index] || { ticks:[] };
+  // Uses the EXPLICIT combo's index, not whatever is globally focused —
+  // critical now that every index is evaluated independently and concurrently
+  const store = S.indexData[sym || S.index] || { ticks:[] };
   const longTicks = store.ticks.slice(-100);
   const longCounts = new Array(10).fill(0);
   longTicks.forEach(d => longCounts[d]++);
@@ -1944,26 +2032,15 @@ function analyzeRiseFall(data, prices) {
 // ─────────────────────────────────────────────────────
 // KELLY POSITION SIZING
 // ─────────────────────────────────────────────────────
-function computeKellyStake() {
-  const tier = TIERS[S.tier];
-  const key   = `${S.index}|${S.strategy}`;
-  const stats = S.optimiser.stats[key];
-
-  // ── PER-COMBO RECENT WINDOW (fixes stale-data bug)
-  // Bug found: V25 1s Rise had old lifetime stats from a prior session,
-  // so Kelly treated it as "proven" and full-staked it — then it went
-  // 2/15 in this session's actual conditions. Lifetime stats can lie.
-  // Fix: track last 20 trades PER COMBO, scale off THAT, not lifetime totals.
+// Returns this combo's classification ('hot'|'warm'|'neutral'|'cold') without
+// touching any global state — used by both Kelly sizing and the entry-gate
+// time filter so every combo reasons about ITS OWN recent performance.
+function getComboRegime(index, strategy) {
+  const key = `${index}|${strategy}`;
   if(!S.comboRecent) S.comboRecent = {};
-  if(!S.comboRecent[key]) S.comboRecent[key] = [];
-  const recent = S.comboRecent[key];
+  const recent = S.comboRecent[key] || [];
+  if(recent.length < 8) return { state:'neutral', edge:0, recentWR:0.5 };
 
-  // Not enough recent data on THIS combo in THIS session → exploration stake
-  if(recent.length < 8) {
-    return Math.max(0.35, +(S.baseStake * 0.5).toFixed(2));
-  }
-
-  // Recent performance (last up to 20 trades on this exact combo)
   const recentWins  = recent.filter(p => p > 0);
   const recentLosses= recent.filter(p => p < 0).map(p => Math.abs(p));
   const recentWR    = recentWins.length / recent.length;
@@ -1972,25 +2049,42 @@ function computeKellyStake() {
   const recentBE    = (recentAvgW+recentAvgL) > 0 ? recentAvgL/(recentAvgW+recentAvgL) : 0.5;
   const recentEdge  = recentWR - recentBE;
 
-  // ── REGIME CLASSIFICATION — now driven by THIS combo's recent results
-  let scale;
-  if(recentEdge > 0.12) {
-    scale = tier.maxScale; S.regimeState = 'hot';
-  } else if(recentEdge > 0.03) {
-    scale = Math.min(1.3, tier.maxScale); S.regimeState = 'warm';
-  } else if(recentEdge > -0.05) {
-    scale = 1.0; S.regimeState = 'neutral';
-  } else {
-    // Negative recent edge on THIS combo — this is what V25 needed and didn't get
-    scale = tier.minScale; S.regimeState = 'cold';
+  let state;
+  if(recentEdge > 0.12)      state = 'hot';
+  else if(recentEdge > 0.03) state = 'warm';
+  else if(recentEdge > -0.05) state = 'neutral';
+  else                        state = 'cold';
+  return { state, edge: recentEdge, recentWR };
+}
+
+// Kelly stake for a SPECIFIC combo — every concurrently-trading pair gets
+// its own correctly-scaled stake based on ITS OWN recent performance only.
+function computeKellyStake(index, strategy) {
+  const tier = TIERS[S.tier];
+  const key  = `${index}|${strategy}`;
+
+  if(!S.comboRecent) S.comboRecent = {};
+  if(!S.comboRecent[key]) S.comboRecent[key] = [];
+  const recent = S.comboRecent[key];
+
+  // Not enough recent data on THIS combo → exploration stake
+  if(recent.length < 8) {
+    return Math.max(0.35, +(S.baseStake * 0.5).toFixed(2));
   }
 
-  // Hard kill: if last 5 trades on this combo are 4+ losses, force minimum stake
-  // regardless of older history — this is the direct fix for the V25 burst losses
+  const regime = getComboRegime(index, strategy);
+  let scale;
+  if(regime.state === 'hot')         scale = tier.maxScale;
+  else if(regime.state === 'warm')   scale = Math.min(1.3, tier.maxScale);
+  else if(regime.state === 'neutral')scale = 1.0;
+  else                                scale = tier.minScale;
+
+  // Hard kill: if last 5 trades on THIS combo are 4+ losses, force minimum
+  // stake regardless of older history — direct fix for burst-loss scenarios
   const last5 = recent.slice(-5);
   const last5Losses = last5.filter(p => p < 0).length;
   if(last5.length === 5 && last5Losses >= 4) {
-    scale = tier.minScale * 0.5; // even more conservative than normal cold
+    scale = tier.minScale * 0.5;
   }
 
   const stake = +(S.baseStake * scale).toFixed(2);
@@ -1998,60 +2092,37 @@ function computeKellyStake() {
   return Math.max(0.35, Math.min(stake, cap));
 }
 
-// Update regime buffer (global, for UI display) + per-combo recent window (for Kelly)
-function updateRegime(won, profit) {
+// Update regime tracking for a SPECIFIC combo (per-combo recent window —
+// what Kelly actually uses) plus the GLOBAL aggregate buffer (used only
+// for the overall "how is the bot doing" KPI tile, not for any decisions).
+function updateRegime(won, profit, index, strategy) {
   S.regimeBuffer.push(won);
   if(S.regimeBuffer.length > 10) S.regimeBuffer.shift();
   S.regimeWR = S.regimeBuffer.filter(Boolean).length / S.regimeBuffer.length;
 
-  // Per-combo recent window — this is what Kelly actually uses now
-  const key = `${S.index}|${S.strategy}`;
+  const key = `${index}|${strategy}`;
   if(!S.comboRecent) S.comboRecent = {};
   if(!S.comboRecent[key]) S.comboRecent[key] = [];
   S.comboRecent[key].push(profit);
-  if(S.comboRecent[key].length > 20) S.comboRecent[key].shift(); // rolling 20-trade window
+  if(S.comboRecent[key].length > 20) S.comboRecent[key].shift();
 }
 
 // ─────────────────────────────────────────────────────
-// TRADE DECISION
+// TRADE DECISION — CONCURRENT, PER-COMBO
+// Every (index, strategy) combo is evaluated and can trade fully
+// independently. No cap on how many can hold positions at once —
+// the only global stop is the aggregate daily SL/PT below, which
+// applies regardless of how many combos contributed to it.
 // ─────────────────────────────────────────────────────
-function decideAndTrade(analysis) {
-  if(!analysis || !S.running || S.waitingResult) return;
-  if(!analysis.bestBet) return;
+function maybeEnterPosition(index, strategy) {
+  if(!S.running) return;
 
-  const tier = TIERS[S.tier];
-
-  // ── TIME FILTER (from quant analysis: 13:00-14:00 GMT = -$2,015, 48.6% WR)
-  // During restricted hours, only trade if momentum is HOT (WR > 60%)
-  const gmtHour = new Date().getUTCHours();
-  const restrictedHour = (gmtHour === 13); // 13:00-14:00 GMT is structural loser
-  if(restrictedHour && S.regimeState !== 'hot') {
-    // Skip trade during bad hour unless we're on a confirmed hot streak
-    S.skippedSignals++;
-    document.getElementById('pvSkipped').textContent = S.skippedSignals;
-    return;
-  }
-
-  // ── STREAK CIRCUIT BREAKER → SMART SWITCH
-  // Fast exit when regime was hot and now flipping (autocorr +0.48 — momentum persists)
-  const prevRegimeWasHot = S.regimeBuffer.slice(-5).filter(Boolean).length >= 4;
-  const fastExitThreshold = prevRegimeWasHot ? 3 : tier.streakBreaker;
-  if(S.curLossStreak >= fastExitThreshold) {
-    const switched = streakSwitch();
-    if(switched) return;
-    S.martLevel = 0; S.currentStake = S.baseStake;
-    S.recoveryPendingLevel = 0; S.streakLoss = 0;
-    if(S.curLossStreak >= fastExitThreshold) {
-      showNotif(`⚡ ${prevRegimeWasHot?'Hot regime flip':'Streak'} reset on ${S.index}`, 'info');
-    }
-  }
-
-  // CHECK SESSION LIMITS — use cumulative session P&L (S.totalPnl)
+  // ── GLOBAL AGGREGATE SAFETY NET — the one hard ceiling regardless
+  // of how many combos are trading. Uses real balance (ground truth),
+  // exactly as before. This check runs on every opportunity check so
+  // it can never be bypassed by however many concurrent combos exist.
   const ptDollar = parseFloat(document.getElementById('ctrlPT').value) || 5000;
   const slDollar = parseFloat(document.getElementById('ctrlSL').value) || 2000;
-
-  // Session P&L = balance now minus balance when RUN was pressed
-  // This is ground truth — directly tied to actual account balance change
   const sessionPnlNow = S.balance - S.sessionStartBalance;
 
   if(sessionPnlNow >= ptDollar) {
@@ -2071,40 +2142,57 @@ function decideAndTrade(analysis) {
     return;
   }
 
-  // ── FRACTIONAL KELLY POSITION SIZING
-  // Skip if no valid bet
-  const bet = analysis?.bestBet;
-  if(!bet) {
-    S.skippedSignals++;
-    document.getElementById('pvSkipped').textContent = S.skippedSignals;
-    S.gateStats.sittingOut++;
-    updateMartDecision('sit_out', analysis);
+  const tier = TIERS[S.tier];
+  const comboKey = `${index}|${strategy}`;
+
+  // ── PER-COMBO GUARDS (each combo independent — no global lock) ──
+  S.openPositions  = S.openPositions  || new Map();
+  S.pendingCombos  = S.pendingCombos  || new Set();
+  S.comboLastTradeTime = S.comboLastTradeTime || {};
+  S.comboLossStreak    = S.comboLossStreak    || {};
+  S.comboCooldownUntil = S.comboCooldownUntil || {};
+
+  if(S.openPositions.has(comboKey)) return;   // already holding a position here
+  if(S.pendingCombos.has(comboKey)) return;   // proposal/buy already in flight here
+
+  if(Date.now() < (S.comboCooldownUntil[comboKey] || 0)) return; // this combo is cooling down
+
+  const minGap = strategy === 'digit' ? 800 : 500;
+  if(Date.now() - (S.comboLastTradeTime[comboKey] || 0) < minGap) return;
+
+  // ── TIME FILTER (13:00-14:00 GMT = -$2,015, 48.6% WR in baseline data)
+  // Per-combo now: only trade this specific combo during the bad hour if
+  // ITS OWN recent regime is hot, not a global "is anything hot" flag.
+  const gmtHour = new Date().getUTCHours();
+  if(gmtHour === 13) {
+    const regime = getComboRegime(index, strategy);
+    if(regime.state !== 'hot') return;
+  }
+
+  // ── PER-COMBO LOSS STREAK → LOCAL COOLDOWN (not a global switch)
+  // With every combo already trading in parallel, there's no single
+  // "switch away to" — instead this specific combo just pauses itself.
+  const regime = getComboRegime(index, strategy);
+  const fastExit = regime.state === 'hot' ? 3 : tier.streakBreaker;
+  if((S.comboLossStreak[comboKey] || 0) >= fastExit) {
+    S.comboCooldownUntil[comboKey] = Date.now() + 20000; // 20s local cooldown
+    S.comboLossStreak[comboKey] = 0;
+    showNotif(`⏸ ${index} · ${strategy} cooling down after losses`, 'info');
     return;
   }
 
-  // Kelly stake: scales UP on proven winning combos, DOWN on losing ones
-  // Never escalates after a loss — only after confirmed edge
-  S.martLevel    = 0; // martingale levels no longer used
-  S.currentStake = computeKellyStake();
-
-  // Show Kelly decision in UI
-  const kellyRatio = S.baseStake > 0 ? S.currentStake / S.baseStake : 1;
-  if(kellyRatio > 1.2) {
-    updateMartDecision('escalate', analysis); // green — scaling up on edge
-  } else if(kellyRatio < 0.8) {
-    updateMartDecision('sit_out', analysis);  // dim — scaling down, poor run
-  } else {
-    updateMartDecision('base', analysis);     // neutral — base stake
+  // ── SIGNAL CHECK — this combo's own bet, independent of every other combo
+  const bet = getBetForCombo(index, strategy);
+  if(!bet || bet.ev <= 0) {
+    S.skippedSignals++;
+    document.getElementById('pvSkipped').textContent = S.skippedSignals;
+    return;
   }
 
-  // ── Minimum tick gap between trades: prevents firing on every single tick
-  // Gives the signal window time to refresh with new data
-  const now = Date.now();
-  const minGap = S.strategy === 'digit' ? 800 : 500; // ms between trades
-  if(now - S.lastTradeTime < minGap) return;
-  S.lastTradeTime = now;
+  const stake = computeKellyStake(index, strategy);
+  S.comboLastTradeTime[comboKey] = Date.now();
 
-  executeTrade(analysis.bestBet);
+  enterPosition(index, strategy, bet, stake);
 }
 
 function signalGate(analysis, tier) {
@@ -2113,6 +2201,30 @@ function signalGate(analysis, tier) {
   const bet = analysis?.bestBet;
   if(!bet) return 'sit_out';
   return 'base'; // always trade at Kelly-computed stake
+}
+
+// Read-only display refresh for whichever combo is currently focused in
+// the UI (S.index/S.strategy). Computes the SAME Kelly stake/regime logic
+// real trades use, purely to keep the Signal Engine panel, the Kelly
+// ladder, and the "Kelly Scale" KPI tile honest — has zero effect on
+// actual execution, which happens independently per-combo elsewhere.
+function refreshFocusedComboDisplay(index, strategy, analysis) {
+  const bet = strategy === 'digit' ? analysis?.digitBet : analysis?.riseBet;
+  const stake = computeKellyStake(index, strategy);
+  S.currentStake = stake; // drives seStake / ladder bars / Kelly Scale tile
+
+  const regime = getComboRegime(index, strategy);
+  const el = document.getElementById('msDecision');
+  const reasonEl = document.getElementById('martReason');
+  if(el && reasonEl) {
+    const regimeLabel = {hot:'🔥 HOT',warm:'⬆ WARM',neutral:'● NEUTRAL',cold:'❄ COLD'}[regime.state] || '● NEUTRAL';
+    el.className = 'ms-decision ms-base';
+    el.textContent = `${regimeLabel} · ${(regime.recentWR*100).toFixed(0)}%WR`;
+    const evTxt = bet ? `EV ${(bet.ev*100).toFixed(1)}%` : 'no signal here';
+    const ratio = S.baseStake > 0 ? (stake / S.baseStake).toFixed(2) : '1.00';
+    reasonEl.textContent = `Focused: ${index} · ${strategy.toUpperCase()} — ${evTxt} · Kelly ${ratio}x · (other combos trade independently — see Open Positions)`;
+  }
+  renderLadder();
 }
 
 function updateMartDecision(decision, analysis) {
@@ -2148,48 +2260,42 @@ function updateMartDecision(decision, analysis) {
 }
 
 // ─────────────────────────────────────────────────────
-// TRADE EXECUTION
+// TRADE EXECUTION — fires independently per combo, no global lock.
+// Many of these can be in flight or open at the same time.
 // ─────────────────────────────────────────────────────
-function executeTrade(bet) {
-  if(!S.connected || !S.running || S.waitingResult) return;
-  S.waitingResult = true;
+function enterPosition(index, strategy, bet, stake) {
+  if(!S.connected || !S.running) return;
 
-  // Show active bet banner
-  document.getElementById('activeBetBanner').classList.add('show');
-  document.getElementById('abbType').textContent = `${bet.type} ${bet.barrier ?? ''}`.trim();
-  document.getElementById('abbDesc').textContent = bet.desc;
-  document.getElementById('abbStake').textContent = '$' + S.currentStake.toFixed(2);
-  document.getElementById('abbMeta').textContent = `Level ${S.martLevel} · Payout ${bet.payout}x · EV ${(bet.ev*100).toFixed(2)}%`;
+  const comboKey = `${index}|${strategy}`;
+  S.pendingCombos = S.pendingCombos || new Set();
+  S.pendingCombos.add(comboKey);
 
-  // Normalise contract type to Deriv enum
+  S.reqIdCounter = (S.reqIdCounter || 0) + 1;
+  const reqId = S.reqIdCounter; // monotonic — never collides even if multiple
+                                 // combos fire within the same millisecond
+
+  S.pendingProposals = S.pendingProposals || new Map();
+  S.pendingProposals.set(reqId, { index, strategy, bet, stake });
+
+  renderOpenPositions(); // show "pending" state immediately
+
   const contractType =
     bet.type === 'OVER'  ? 'DIGITOVER'  :
     bet.type === 'UNDER' ? 'DIGITUNDER' :
     bet.type === 'CALL'  ? 'CALL'       : 'PUT';
 
-  // Unique req_id so we can match this proposal response and ignore stale ones
-  const reqId = Date.now() % 1000000; // stays within safe integer range
-  S.pendingReqId = reqId;
-  S.pendingBet   = bet;
-
-  // Proposal request — uses 'underlying_symbol' (not 'symbol') per schema
-  // Do NOT include subscribe:1 — digit/tick contracts don't stream prices
   const proposalReq = {
     proposal:          1,
     req_id:            reqId,
-    amount:            S.currentStake,
+    amount:            stake,
     basis:             'stake',
     contract_type:     contractType,
     currency:          'USD',
-    // 1-tick for ALL contracts — data proves 5-tick payouts (0.71x) are worse
-    // 1-tick payout 0.875x needs 53.3% WR vs 5-tick needing 58.5%
-    // Our delivered WR is 52-55%, clears 1-tick bar, fails 5-tick bar
     duration:          1,
     duration_unit:     't',
-    underlying_symbol: S.index
+    underlying_symbol: index
   };
 
-  // Barrier for digit contracts only
   if(bet.barrier !== null && bet.barrier !== undefined) {
     proposalReq.barrier = String(bet.barrier);
   }
@@ -2202,52 +2308,64 @@ function executeTrade(bet) {
 // ─────────────────────────────────────────────────────
 function handleSettlement(contract) {
   const incomingId = contract.contract_id;
+  S.settledContracts  = S.settledContracts  || new Set();
+  S.boughtContracts   = S.boughtContracts   || new Set();
+  S.contractToCombo   = S.contractToCombo   || new Map();
+  S.openPositions      = S.openPositions      || new Map();
+  S.comboLossStreak    = S.comboLossStreak    || {};
 
-  // GUARD 1: must match the contract we are actually waiting on
-  if(!S.waitingResult || !S.openContract) return;
-  if(incomingId && incomingId != S.openContract) {
-    // Stale/mismatched settlement for a contract we already closed — ignore
-    console.warn('Ignored mismatched settlement', incomingId, 'expected', S.openContract);
-    return;
-  }
-
-  // GUARD 2: dedupe — never process the same contract_id twice
-  S.settledContracts = S.settledContracts || new Set();
-  if(incomingId && S.settledContracts.has(incomingId)) {
-    console.warn('Ignored duplicate settlement', incomingId);
-    return;
-  }
+  // DEDUPE: never process the same contract_id twice, no matter the source
+  if(incomingId && S.settledContracts.has(incomingId)) return;
   if(incomingId) S.settledContracts.add(incomingId);
 
-  // GUARD 3: explicitly cancel this contract's subscription so Deriv
-  // stops sending further updates that could be mis-routed to the next trade
-  if(incomingId) send({ forget_all: 'proposal_open_contract' });
+  // Look up exactly which combo this contract belongs to — tracked at
+  // buy time, not inferred from whatever happens to be globally active.
+  // This is correct even with many combos trading concurrently.
+  const comboKey = incomingId ? S.contractToCombo.get(incomingId) : null;
+  const position  = comboKey ? S.openPositions.get(comboKey) : null;
+  const isKnown   = !!position;
 
-  processResult(contract);
+  if(isKnown) {
+    // ── FINANCIAL TRUTH + correct attribution — we know exactly which
+    // index/strategy this outcome belongs to, so regime/optimiser stats
+    // stay accurate even while other combos are trading in parallel.
+    recordContractOutcome(contract, true, position.index, position.strategy);
+
+    const win = parseFloat(contract.profit) > 0;
+    S.comboLossStreak[comboKey] = win ? 0 : (S.comboLossStreak[comboKey] || 0) + 1;
+
+    S.openPositions.delete(comboKey);
+    S.contractToCombo.delete(incomingId);
+    renderOpenPositions();
+  } else {
+    // Truly orphaned (e.g. a leftover from before this tracking existed,
+    // or an edge case the Maps missed) — still record the real money
+    // movement unconditionally, just without per-combo attribution.
+    recordContractOutcome(contract, false, null, null);
+    if(incomingId) {
+      showNotif(`⚠ Recovered orphaned contract ${incomingId} — P&L corrected`, 'warn');
+    }
+  }
 }
 
-function processResult(contract) {
-  S.waitingResult = false;
-  S.openContract = null;
-  document.getElementById('activeBetBanner').classList.remove('show');
-
+function recordContractOutcome(contract, isActiveTrade, index, strategy) {
   const profit = parseFloat(contract.profit) || 0;
   const win = profit > 0;
-  const ct = (contract.contract_type || S.pendingBet?.type || '');
+  const ct = contract.contract_type || '';
   const ctype = ct.includes('OVER') || ct === 'OVER'   ? 'OVER'  :
                 ct.includes('UNDER') || ct === 'UNDER' ? 'UNDER' :
-                ct === 'CALL' ? 'CALL' : 'PUT';
+                ct === 'CALL' ? 'CALL' : ct === 'PUT' ? 'PUT' : 'UNKNOWN';
 
-  // Don't update S.balance locally — Deriv's balance message is the source of truth
-  // S.balance will be updated when the balance subscription fires after trade
+  // FINANCIAL TRUTH — always recorded, regardless of trade context.
+  // Unconditional: represents real money that moved on the real Deriv
+  // account and must never be silently dropped, no matter how many
+  // other combos are trading concurrently.
   S.totalPnl += profit;
   S.pnlHistory.push(S.totalPnl);
 
-  // Update drawdown
   S.peakBalance = Math.max(S.peakBalance, S.balance - profit + (win ? 0 : Math.abs(profit)));
   if(S.balance < S.peakBalance) S.maxDrawdown = Math.max(S.maxDrawdown, S.peakBalance - S.balance);
 
-  // Breakdown
   if(!S.betBreakdown[ctype]) S.betBreakdown[ctype] = {w:0, l:0, winAmt:0, lossAmt:0};
 
   if(win) {
@@ -2255,20 +2373,27 @@ function processResult(contract) {
     S.curWinStreak++; S.curLossStreak = 0;
     S.maxWinStreak = Math.max(S.maxWinStreak, S.curWinStreak);
     S.betBreakdown[ctype].w++; S.betBreakdown[ctype].winAmt += profit;
-    processWin(profit);
-    showNotif(`✅ WIN +$${profit.toFixed(2)}`, 'success');
+    showNotif(`${isActiveTrade?'✅':'⚠'} ${index||''} WIN +$${profit.toFixed(2)}${isActiveTrade?'':' (recovered)'}`, isActiveTrade?'success':'warn');
   } else {
     S.losses++; S.totalLossAmt += Math.abs(profit); S.worstLoss = Math.min(S.worstLoss, profit);
     S.curLossStreak++; S.curWinStreak = 0;
     S.maxLossStreak = Math.max(S.maxLossStreak, S.curLossStreak);
     S.betBreakdown[ctype].l++; S.betBreakdown[ctype].lossAmt += Math.abs(profit);
-    processLoss(Math.abs(profit));
-    showNotif(`❌ LOSS -$${Math.abs(profit).toFixed(2)}`, 'error');
+    showNotif(`${isActiveTrade?'❌':'⚠'} ${index||''} LOSS -$${Math.abs(profit).toFixed(2)}${isActiveTrade?'':' (recovered)'}`, isActiveTrade?'error':'warn');
   }
 
-  updateRegime(win, profit);   // update momentum regime + per-combo recent window
-  addToLog(win, profit, ctype, contract.barrier);
-  optRecordTrade(win, profit); // feed optimiser
+  // STRATEGY ATTRIBUTION — only when we KNOW exactly which combo this
+  // belongs to (tracked at buy time, passed explicitly here). Under
+  // concurrent execution this is no longer "whatever happens to be
+  // globally active" — it's the real, specific combo this contract was
+  // bought for, so attribution stays correct no matter how many other
+  // combos are simultaneously open.
+  if(isActiveTrade && index && strategy) {
+    updateRegime(win, profit, index, strategy);
+    optRecordTrade(win, profit, index, strategy);
+  }
+
+  addToLog(win, profit, ctype, contract.barrier, isActiveTrade, contract, index, strategy);
 
   // Request real balance from Deriv after every trade
   // This prevents local math drift from inflating S.balance
@@ -2338,46 +2463,10 @@ function switchIndex(el) {
 // Finds best scoring combo that is NOT the current one
 // Returns true if switched, false if no better option found
 // ─────────────────────────────────────────────────────
-function streakSwitch() {
-  if(S.comboScores.length === 0) return false;
-
-  const currentKey = `${S.index}|${S.strategy}`;
-
-  // Only switch to combos with proven trade history (≥20 trades)
-  // Never switch to an untested combo — that's what caused the V25/R_25 losses
-  const MIN_SWITCH_TRADES = 10;
-  const best = S.comboScores.find(s => {
-    if(`${s.sym}|${s.strategy}` === currentKey) return false;
-    if(s.confidence <= 10) return false;
-    const stats = S.optimiser.stats[`${s.sym}|${s.strategy}`];
-    return stats && stats.trades >= MIN_SWITCH_TRADES;
-  });
-
-  if(!best) return false;
-
-  const prevLabel = `${S.index} · ${S.strategy}`;
-  S.index    = best.sym;
-  S.strategy = best.strategy;
-
-  // Reset martingale + regime on switch — clean slate for new combo
-  S.martLevel = 0; S.currentStake = S.baseStake;
-  S.recoveryPendingLevel = 0; S.streakLoss = 0;
-  S.curLossStreak = 0;
-  S.regimeBuffer = []; S.regimeWR = 0.5; S.regimeState = 'neutral';
-
-  // Update UI pills
-  document.querySelectorAll('.index-pill').forEach(p =>
-    p.classList.toggle('active', p.dataset.idx === best.sym));
-  document.getElementById('strat-digit').classList.toggle('active', best.strategy === 'digit');
-  document.getElementById('strat-rise').classList.toggle('active',  best.strategy === 'rise');
-
-  showNotif(
-    `🔄 Streak switch: ${prevLabel} → ${best.label} (score ${best.score.toFixed(0)})`,
-    'warn'
-  );
-  renderLadder();
-  return true;
-}
+// NOTE: the old single-combo streakSwitch() is gone — superseded by
+// per-combo cooldowns inside maybeEnterPosition(). With every combo
+// already trading concurrently, "switching away" doesn't apply; instead
+// each combo independently pauses itself after a local loss streak.
 
 // ─────────────────────────────────────────────────────
 // PARALLEL SCORING ENGINE
@@ -2470,31 +2559,31 @@ function runScoringPass() {
   // Update scoring panel
   renderScoringPanel();
 
-  if(!S.running || S.waitingResult) return;
+  if(!S.running) return;
 
-  // Auto-switch only if AUTO optimiser is OFF (optimiser handles its own switching)
-  if(S.optimiser.enabled) return;
+  // ── UI FOCUS ONLY — does NOT gate trading anymore.
+  // Every combo trades independently via maybeEnterPosition() regardless
+  // of what's shown here. This just keeps the main Signal Engine panel
+  // pointed at whatever is currently performing best, for convenience.
+  if(S.optimiser.enabled) return; // optimiser drives its own focus rotation
 
   if(scores.length === 0) return;
 
-  // Only consider combos with minimum trade history — no switching to untested combos
-  const MIN_TRADES_TO_SWITCH = 10;
-  const MIN_CONFIDENCE       = 25;
-  const MIN_SCORE_GAP        = 20;
-  const COOLDOWN_MS          = 3000; // max one switch per 3s
+  const MIN_TRADES_TO_FOCUS = 10;
+  const MIN_CONFIDENCE      = 25;
+  const MIN_SCORE_GAP       = 20;
+  const COOLDOWN_MS         = 3000;
 
-  // Find best combo that has enough trade history
   const testedScores = scores.filter(s => {
     const k = `${s.sym}|${s.strategy}`;
     const stats = S.optimiser.stats[k];
-    return stats && stats.trades >= MIN_TRADES_TO_SWITCH && s.confidence >= MIN_CONFIDENCE;
+    return stats && stats.trades >= MIN_TRADES_TO_FOCUS && s.confidence >= MIN_CONFIDENCE;
   });
-
-  if(testedScores.length === 0) return; // no tested combos — stay put
+  if(testedScores.length === 0) return;
 
   const best = testedScores[0];
   const currentKey = `${S.index}|${S.strategy}`;
-  if(`${best.sym}|${best.strategy}` === currentKey) return; // already on best
+  if(`${best.sym}|${best.strategy}` === currentKey) return;
 
   const currentScore = scores.find(s => s.sym === S.index && s.strategy === S.strategy);
   const gap = best.score - (currentScore?.score ?? -999);
@@ -2507,7 +2596,8 @@ function runScoringPass() {
       p.classList.toggle('active', p.dataset.idx === best.sym));
     document.getElementById('strat-digit').classList.toggle('active', best.strategy==='digit');
     document.getElementById('strat-rise').classList.toggle('active',  best.strategy==='rise');
-    showNotif(`⚡ Switch → ${best.label} | score ${best.score.toFixed(0)} | ${MIN_TRADES_TO_SWITCH}+ trades tested`, 'info');
+    // Note: this does NOT start/stop trading on any combo — every combo
+    // with positive EV is already trading concurrently regardless of focus
   }
 }
 
@@ -2573,25 +2663,36 @@ function optGetExpectancy(combo) {
   return wr * avgW - (1 - wr) * avgL;
 }
 
-function optRecordTrade(win, profit) {
-  if(!S.optimiser.enabled) return;
-  const opt   = S.optimiser;
-  const combo = opt.lockedCombo || opt.combos[opt.currentCombo];
-  const k     = optKey(combo);
+function optRecordTrade(win, profit, index, strategy) {
+  const opt = S.optimiser;
+
+  // Always credit stats to the REAL combo this trade came from — under
+  // concurrent execution, many combos can settle trades in between the
+  // optimiser's own rotation steps. Stats must never be misattributed
+  // to whatever the optimiser happens to be rotating through right now.
+  const k = index && strategy ? `${index}|${strategy}` : optKey(opt.lockedCombo || opt.combos[opt.currentCombo]);
 
   if(!opt.stats[k]) opt.stats[k] = { trades:0, wins:0, winAmt:0, lossAmt:0, blocks:0 };
   opt.stats[k].trades++;
   if(win) { opt.stats[k].wins++; opt.stats[k].winAmt += profit; }
   else    { opt.stats[k].lossAmt += Math.abs(profit); }
-
-  opt.blockTrades++;
   optSaveStats();
 
-  // Check if block complete
-  if(opt.blockTrades >= opt.blockSize) {
-    opt.stats[k].blocks++;
-    opt.blockTrades = 0;
-    optOnBlockComplete(combo, k);
+  // Block-rotation pacing only advances for the optimiser's OWN currently
+  // focused combo — trades arriving concurrently from other combos still
+  // get their stats recorded above, just without disturbing the rotation
+  // schedule of whichever combo the optimiser is deliberately exploring.
+  if(opt.enabled) {
+    const rotationCombo = opt.lockedCombo || opt.combos[opt.currentCombo];
+    const rotationKey   = optKey(rotationCombo);
+    if(k === rotationKey) {
+      opt.blockTrades++;
+      if(opt.blockTrades >= opt.blockSize) {
+        opt.stats[k].blocks++;
+        opt.blockTrades = 0;
+        optOnBlockComplete(rotationCombo, k);
+      }
+    }
   }
 
   renderOptimiserPanel();
@@ -2873,6 +2974,7 @@ function resetSession() {
   S.gateStats = { escalated:0, held:0, sittingOut:0, recovered:0 };
   S.waitingResult=false; S.openContract=null; S.lastTradeTime=0; S.recoveryPendingLevel=0; S.recoveryTicks=0;
   S.settledContracts = new Set(); // clear dedup set on session reset
+  S.boughtContracts  = new Set();
   S.regimeBuffer=[]; S.regimeWR=0.5; S.regimeState='neutral'; S.timeFilterActive=false;
   S.comboRecent={}; // full session reset clears per-combo recent memory too
   if(S.optimiser.enabled) {
@@ -2886,7 +2988,10 @@ function resetSession() {
   document.getElementById('tradeLog').innerHTML = '<div style="padding:20px;text-align:center;font-family:var(--font-m);font-size:10px;color:var(--text2)">No trades yet.<br>Start the bot.</div>';
   document.getElementById('tlCount').textContent = '0 trades';
   document.getElementById('slBanner').classList.remove('show');
-  document.getElementById('activeBetBanner').classList.remove('show');
+  S.openPositions = new Map(); S.contractToCombo = new Map();
+  S.pendingProposals = new Map(); S.pendingCombos = new Set();
+  S.comboLastTradeTime = {}; S.comboLossStreak = {}; S.comboCooldownUntil = {};
+  renderOpenPositions();
   document.getElementById('pauseBadge').classList.remove('show');
   computeBaseStake();
   renderLadder();
@@ -2915,7 +3020,7 @@ function setStrategy(mode) {
   document.getElementById('strat-rise').classList.toggle('active', mode==='rise');
   document.getElementById('stratDesc').textContent = mode === 'digit'
     ? 'DIGIT: OVER 5/6 or UNDER 3/4/5 only. EV must be >2% to trade.'
-    : 'RISE/FALL: 5-tick momentum. +2.55pp confirmed edge over 472 trades.';
+    : 'RISE/FALL: 1-tick dual-MA momentum, trading every pair concurrently.';
   showNotif(`Strategy: ${mode === 'digit' ? 'DIGIT (Over/Under)' : 'RISE / FALL'}`, 'info');
 }
 
@@ -3019,6 +3124,64 @@ function renderSignalView(analysis) {
       </div>`;
   });
 }
+
+// ─────────────────────────────────────────────────────
+// OPEN POSITIONS LIST — shows every concurrently-open or pending
+// combo, since there's no cap on how many can be live at once.
+// ─────────────────────────────────────────────────────
+function renderOpenPositions() {
+  const container = document.getElementById('openPositionsList');
+  const countEl   = document.getElementById('opCount');
+  if(!container) return;
+
+  S.openPositions    = S.openPositions    || new Map();
+  S.pendingProposals  = S.pendingProposals  || new Map();
+
+  const openCount    = S.openPositions.size;
+  const pendingCount = S.pendingProposals.size;
+  countEl.textContent = `${openCount} open${pendingCount ? ` · ${pendingCount} pending` : ''}`;
+
+  if(openCount === 0 && pendingCount === 0) {
+    container.className = 'op-empty';
+    container.innerHTML = 'No open positions — scanning all pairs for signals...';
+    return;
+  }
+
+  container.className = '';
+  let html = '';
+
+  S.openPositions.forEach((pos, comboKey) => {
+    const elapsed = Math.floor((Date.now() - pos.boughtAt) / 1000);
+    const label = pos.index.replace('1HZ','V').replace('100V','100 1s').replace('75V','75 1s').replace('50V','50 1s').replace('25V','25 1s').replace('10V','10 1s');
+    html += `
+      <div class="op-row">
+        <div>
+          <div class="op-combo">${label} · ${pos.strategy.toUpperCase()}</div>
+          <div class="op-desc">${pos.bet?.desc || pos.bet?.label || ''}</div>
+        </div>
+        <div class="op-stake">$${pos.stake.toFixed(2)}</div>
+        <div class="op-meta">EV ${((pos.bet?.ev||0)*100).toFixed(1)}%</div>
+        <div class="op-elapsed">${elapsed}s</div>
+      </div>`;
+  });
+
+  S.pendingProposals.forEach((pend) => {
+    const label = pend.index.replace('1HZ','V').replace('100V','100 1s').replace('75V','75 1s').replace('50V','50 1s').replace('25V','25 1s').replace('10V','10 1s');
+    html += `
+      <div class="op-row pending">
+        <div>
+          <div class="op-combo">${label} · ${pend.strategy.toUpperCase()}</div>
+          <div class="op-desc">Confirming entry...</div>
+        </div>
+        <div class="op-stake">$${pend.stake.toFixed(2)}</div>
+        <div class="op-meta">—</div>
+        <div class="op-elapsed">···</div>
+      </div>`;
+  });
+
+  container.innerHTML = html;
+}
+setInterval(() => { if(S.openPositions?.size > 0) renderOpenPositions(); }, 1000); // tick elapsed timers
 
 function renderLadder() {
   const tier = TIERS[S.tier];
@@ -3212,13 +3375,23 @@ function updateAnalytics() {
   `;
 }
 
-function addToLog(win, profit, type, barrier) {
+function addToLog(win, profit, type, barrier, isActiveTrade, contract, knownIndex, knownStrategy) {
   const log = document.getElementById('tradeLog');
   const empty = log.querySelector('[style*="No trades"]');
   if(empty) empty.remove();
 
   const tot = S.wins + S.losses;
   const now = new Date();
+  isActiveTrade = isActiveTrade !== false; // default true for any legacy callers
+
+  // Prefer the EXPLICITLY tracked combo (set at buy time — always correct
+  // under concurrent execution) over the contract payload, and only fall
+  // back to global S.index/S.strategy for truly unknown orphans.
+  const tradeIndex = knownIndex || contract?.underlying || contract?.symbol || contract?.underlying_symbol || S.index;
+  const tradeStrategy = knownStrategy
+    ? knownStrategy.toUpperCase()
+    : (type === 'CALL' || type === 'PUT' ? 'RISE' : type === 'OVER' || type === 'UNDER' ? 'DIGIT' : S.strategy.toUpperCase());
+  const tradeStake = parseFloat(contract?.buy_price) || S.currentStake;
 
   // Store full trade record for CSV export
   S.trades.push({
@@ -3226,33 +3399,38 @@ function addToLog(win, profit, type, barrier) {
     timestamp:    now.toISOString(),
     time_gmt:     now.toTimeString().slice(0,8),
     result:       win ? 'WIN' : 'LOSS',
-    strategy:     S.strategy.toUpperCase(),
-    index:        S.index,
+    strategy:     tradeStrategy,
+    index:        tradeIndex,
     contract_type: type,
     barrier:      barrier ?? '',
-    stake:        S.currentStake,
+    stake:        tradeStake,
     profit:       profit,
-    mart_level:   S.martLevel,
-    session_pnl:  S.totalPnl,
-    chi2:         S.lastAnalysis ? parseFloat(S.lastAnalysis.chi.toFixed(2)) : 0,
-    signal:       S.lastAnalysis ? S.lastAnalysis.sigStrength : 'unknown',
+    mart_level:   isActiveTrade ? S.martLevel : 0,
+    session_pnl:  S.sessionStartBalance > 0 ? S.balance - S.sessionStartBalance : S.totalPnl, // same basis as SL/PT check
+    chi2:         isActiveTrade && S.lastAnalysis ? parseFloat(S.lastAnalysis.chi.toFixed(2)) : 0,
+    signal:       isActiveTrade && S.lastAnalysis ? S.lastAnalysis.sigStrength : 'recovered',
     risk_tier:    S.tier,
+    recovered:    !isActiveTrade,
   });
 
   const label = barrier ? (type === 'OVER' ? `Over ${barrier}` : `Under ${barrier}`) : type;
   const el = document.createElement('div');
   el.className = `trade-entry ${win?'win':'loss'}`;
+  const recoveredTag = isActiveTrade ? '' : `
+      <span style="font-family:var(--font-m);font-size:8px;letter-spacing:1px;
+        background:rgba(245,158,11,.18);color:var(--amber);border:1px solid rgba(245,158,11,.35);
+        border-radius:3px;padding:1px 5px;margin-left:6px">RECOVERED</span>`;
   el.innerHTML = `
     <div class="te-top">
       <span class="te-type" style="color:${win?'var(--green)':'var(--red)'}">
-        ${win?'▲ WIN':'▼ LOSS'} · ${label}
+        ${win?'▲ WIN':'▼ LOSS'} · ${label}${recoveredTag}
       </span>
       <span class="te-pnl" style="color:${win?'var(--green)':'var(--red)'}">
         ${win?'+':'-'}$${Math.abs(profit).toFixed(2)}
       </span>
     </div>
     <div class="te-meta">
-      Stake $${S.currentStake.toFixed(2)} · Level ${S.martLevel} · ${now.toTimeString().slice(0,8)} · #${tot}
+      ${tradeIndex} · Stake $${tradeStake.toFixed(2)} · ${now.toTimeString().slice(0,8)} · #${tot}
     </div>`;
   log.insertBefore(el, log.firstChild);
   document.getElementById('tlCount').textContent = tot + ' trades';
@@ -3732,4 +3910,3 @@ initOnLoad();
 </script>
 </body>
 </html>
-
