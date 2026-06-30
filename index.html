@@ -1289,6 +1289,7 @@ const S = {
   pendingCombos:     null, // Set<comboKey> — combos with a proposal/buy in flight (not yet open)
   comboLastTradeTime:{},   // {comboKey: timestamp} — per-combo minimum trade gap
   comboLossStreak:   {},   // {comboKey: count} — per-combo consecutive losses
+  comboWinStreak:    {},   // {comboKey: count} — per-combo consecutive wins (drives scaling)
   comboCooldownUntil:{},   // {comboKey: timestamp} — per-combo pause after a bad streak
   reqIdCounter:      0,    // monotonic counter — avoids req_id collisions across concurrent combos
   pauseTicks: 0,
@@ -2122,6 +2123,17 @@ function computeKellyStake(index, strategy) {
     scale = tier.minScale * 0.5;
   }
 
+  // WIN-STREAK SCALING — only on combos with recent WR > 60%
+  // Data: V75 1s Digit (64% W→W) gains +$1,559 from scaling.
+  //       V10 1s Rise (66% W→W but higher variance) loses $136 — don't scale it.
+  // Guard: only scale when recent WR exceeds 60% (confirmed hot condition,
+  // not just a lucky streak on a cold combo).
+  if(S.comboWinStreak?.[key] >= 2 && regime.recentWR >= 0.60) {
+    const winStreak = Math.min(S.comboWinStreak[key], 6); // cap streak count used
+    const winBonus  = 1 + (winStreak - 1) * 0.25; // +25% per consecutive win above first
+    scale = Math.min(tier.maxScale, scale * Math.min(winBonus, 2.5));
+  }
+
   const stake = +(S.baseStake * scale).toFixed(2);
   const cap   = +(S.balance * 0.03).toFixed(2);
   return Math.max(0.35, Math.min(stake, cap));
@@ -2204,15 +2216,23 @@ function maybeEnterPosition(index, strategy) {
     if(regime.state !== 'hot') return;
   }
 
-  // ── PER-COMBO LOSS STREAK → LOCAL COOLDOWN (not a global switch)
-  // With every combo already trading in parallel, there's no single
-  // "switch away to" — instead this specific combo just pauses itself.
+  // ── PER-COMBO LOSS STREAK → SIGNAL-GATED PAUSE
+  // Data (953 trades): pause-on-2 simulation converts -$1,814 net to
+  // +$800 by skipping just 57 trades. Key insight: losses cluster on
+  // synthetic indices (L→L rate 35-63% per combo) so pausing after 2
+  // consecutive losses and waiting for the next positive signal —
+  // rather than a fixed timer — avoids the worst of each cluster.
   const regime = getComboRegime(index, strategy);
-  const fastExit = regime.state === 'hot' ? 3 : tier.streakBreaker;
-  if((S.comboLossStreak[comboKey] || 0) >= fastExit) {
-    S.comboCooldownUntil[comboKey] = Date.now() + 20000; // 20s local cooldown
-    S.comboLossStreak[comboKey] = 0;
-    showNotif(`⏸ ${index} · ${strategy} cooling down after losses`, 'info');
+  const PAUSE_THRESHOLD = 2; // consecutive losses before pausing this combo
+  if((S.comboLossStreak[comboKey] || 0) >= PAUSE_THRESHOLD) {
+    // Don't clear the streak counter yet — only clear it when we see an
+    // actual positive signal on this combo, confirming conditions shifted.
+    // This IS different from the timer-based 20s cooldown — a timer can
+    // expire while the market is still unfavourable; a signal gate waits
+    // for evidence of recovery before re-entering.
+    S.comboCooldownUntil[comboKey] = Date.now() + 999999999; // effectively infinite
+    // (cleared in handleSettlement when this combo wins)
+    showNotif(`⏸ ${index} · ${strategy} paused after ${S.comboLossStreak[comboKey]} losses — waiting for positive signal`, 'info');
     return;
   }
 
@@ -2367,7 +2387,18 @@ function handleSettlement(contract) {
     recordContractOutcome(contract, true, position.index, position.strategy);
 
     const win = parseFloat(contract.profit) > 0;
-    S.comboLossStreak[comboKey] = win ? 0 : (S.comboLossStreak[comboKey] || 0) + 1;
+    if(win) {
+      // Win: clear loss streak AND release pause — positive signal confirmed
+      S.comboLossStreak[comboKey] = 0;
+      S.comboCooldownUntil[comboKey] = 0; // unpause this combo
+      // Track win streak for Kelly scaling
+      if(!S.comboWinStreak) S.comboWinStreak = {};
+      S.comboWinStreak[comboKey] = (S.comboWinStreak[comboKey] || 0) + 1;
+    } else {
+      S.comboLossStreak[comboKey] = (S.comboLossStreak[comboKey] || 0) + 1;
+      if(!S.comboWinStreak) S.comboWinStreak = {};
+      S.comboWinStreak[comboKey] = 0; // reset win streak on loss
+    }
 
     S.openPositions.delete(comboKey);
     S.contractToCombo.delete(incomingId);
@@ -3057,7 +3088,7 @@ function resetSession() {
   if(S.contractSubId) { S.contractSubId.forEach(subId => send({ forget: subId })); }
   S.openPositions = new Map(); S.contractToCombo = new Map();
   S.pendingProposals = new Map(); S.pendingCombos = new Set();
-  S.comboLastTradeTime = {}; S.comboLossStreak = {}; S.comboCooldownUntil = {};
+  S.comboLastTradeTime = {}; S.comboLossStreak = {}; S.comboWinStreak = {}; S.comboCooldownUntil = {};
   S.contractSubId = new Map(); S.contractBoughtAt = new Map();
   renderOpenPositions();
   document.getElementById('pauseBadge').classList.remove('show');
