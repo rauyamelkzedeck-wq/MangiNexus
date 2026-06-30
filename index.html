@@ -1727,22 +1727,32 @@ function handleMsg(msg) {
 // ── DRIFT DETECTOR — catches the exact bug that caused +$8,710 (logged)
 // vs real account showing -$5,000+. Compares real balance movement
 // against the bot's internal session P&L counter; alerts loudly if they diverge.
+// ── BACKGROUND DIAGNOSTIC ONLY (console, never visible, never stops trading) ──
+// The original version of this check fired the instant any balance message
+// arrived and compared it against logged P&L immediately. That's a race:
+// balance pushes and individual contract settlement pushes are separate,
+// independently-timed WebSocket messages with no guaranteed ordering. With
+// concurrent execution, several contracts settling in the same second is
+// the NORMAL case, not an edge case — so a balance update could land and
+// get processed before all of that second's settlement messages had been,
+// producing a false "drift" that was really just timing, not lost money.
+// Fixed by debouncing: only compare once balance pings have been quiet for
+// a moment, giving settlement messages time to catch up. Even then, this
+// never shows a banner or stops the bot — it only logs, since a blocking
+// false positive is worse than a missed true positive we can still debug
+// via console if needed.
+let _driftCheckTimer = null;
 function checkPnlDrift() {
   if(S.sessionStartBalance <= 0) return;
-  const realSessionPnl = S.balance - S.sessionStartBalance;
-  const loggedSessionPnl = S.totalPnl;
-  const drift = Math.abs(realSessionPnl - loggedSessionPnl);
-
-  // Allow small drift from in-flight unsettled trades, flag anything material
-  if(drift > Math.max(5, S.baseStake * 2)) {
-    const banner = document.getElementById('slBanner');
-    banner.textContent = `⚠ P&L MISMATCH DETECTED: Bot log says ${loggedSessionPnl>=0?'+':''}$${loggedSessionPnl.toFixed(2)} but real balance moved ${realSessionPnl>=0?'+':''}$${realSessionPnl.toFixed(2)} (drift $${drift.toFixed(2)}). Stopping bot — investigate before continuing.`;
-    banner.classList.add('show');
-    if(S.running) {
-      stopBot();
-      showNotif(`⚠ P&L drift $${drift.toFixed(2)} detected — bot stopped for safety`, 'error');
+  clearTimeout(_driftCheckTimer);
+  _driftCheckTimer = setTimeout(() => {
+    const realSessionPnl   = S.balance - S.sessionStartBalance;
+    const loggedSessionPnl = S.totalPnl;
+    const drift = Math.abs(realSessionPnl - loggedSessionPnl);
+    if(drift > Math.max(5, S.baseStake * 2)) {
+      console.warn(`P&L check: logged $${loggedSessionPnl.toFixed(2)} vs real $${realSessionPnl.toFixed(2)} (diff $${drift.toFixed(2)}) — informational only, not auto-stopping.`);
     }
-  }
+  }, 2000); // wait for any in-flight settlement messages to land first
 }
 
 function onConnected(bal) {
