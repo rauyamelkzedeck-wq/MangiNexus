@@ -2071,14 +2071,25 @@ function analyzeRiseFall(data, prices) {
 
   const payout  = 1.95;
   const ev      = winProb * payout - 1;
-  if(ev <= 0.02) return null; // require genuinely positive EV (>2%), not just >0%
-
-  // Signal strength classification — used for UI and CSV export
+  // Signal strength classification — the REAL gate
   const sigStrength = winProb >= 0.57 ? 'strong' : winProb >= 0.545 ? 'moderate' : 'weak';
 
+  // GATE: only fire on moderate or strong signals.
+  // 'weak' means minimum thresholds just barely met — statistically indistinguishable
+  // from noise. All prior sessions: 100% weak signals → no predictive power.
+  // moderate = winProb 0.545+ = at least 2/3 ticks AND either 3/3 ticks or 4/5 trend
+  // strong   = winProb 0.570+ = 3/3 ticks AND 4/5+ trend
+  if(sigStrength === 'weak') return null;
+
+  // ONLY fire CALL (UP direction). PUT payout is 1.835x needing 56.3% WR
+  // — structurally unachievable with our signal quality. Data: PUT delivered
+  // 44.7% WR this session, -12pp below break-even. CALL needs only 50.5% WR.
+  // A FALL signal is simply skipped — the pair still trades on CALL signals.
+  if(dir !== 'up') return null;
+
   return {
-    type:      dir === 'up' ? 'CALL' : 'PUT',
-    label:     dir === 'up' ? 'RISE' : 'FALL',
+    type:      'CALL',
+    label:     'RISE',
     desc:      `${sigStrength} · Δfast${fastDelta.toFixed(4)} · ${consistent}/3 ticks · ${trendCount}/5 trend`,
     payout, winProb, ev, sigStrength, barrier: null
   };
@@ -2133,6 +2144,21 @@ function computeKellyStake(index, strategy) {
   else if(regime.state === 'warm')   scale = Math.min(1.3, tier.maxScale);
   else if(regime.state === 'neutral')scale = 1.0;
   else                                scale = tier.minScale;
+
+  // ── FAST RESPONSE LAYER — 3-trade override
+  // Fixes the inversion where stakes stay high entering a loss cluster.
+  // Data confirmed: 8 of 10 combos staked more on losses than wins today.
+  // This layer fires before the 8-trade window fully registers the regime shift.
+  const last3 = recent.slice(-3);
+  if(last3.length >= 3) {
+    const last3Losses = last3.filter(p => p < 0).length;
+    const last3Wins   = last3.filter(p => p > 0).length;
+    if(last3Losses === 3) {
+      scale = tier.minScale * 0.5; // 3 straight losses → immediate floor
+    } else if(last3Wins === 3) {
+      scale = Math.max(scale, Math.min(1.5, tier.maxScale)); // 3 straight wins → capture hot run
+    }
+  }
 
   // Hard kill: if last 5 trades on THIS combo are 4+ losses, force minimum
   // stake regardless of older history — direct fix for burst-loss scenarios
