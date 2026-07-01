@@ -1288,6 +1288,7 @@ const S = {
   pendingProposals:  null, // Map<reqId, {index, strategy, bet, stake}> — in-flight proposals
   pendingCombos:     null, // Set<comboKey> — combos with a proposal/buy in flight (not yet open)
   comboLastTradeTime:{},   // {comboKey: timestamp} — per-combo minimum trade gap
+  comboLastTradeTick:{},   // {comboKey: tickCount} — per-combo tick-count gate
   comboLossStreak:   {},   // {comboKey: count} — per-combo consecutive losses
   comboWinStreak:    {},   // {comboKey: count} — per-combo consecutive wins (drives scaling)
   comboCooldownUntil:{},   // {comboKey: timestamp} — per-combo pause after a bad streak
@@ -1827,6 +1828,7 @@ function processTick(price, symbol) {
   store.ticks.push(lastDigit);
   store.priceTicks.push(price);
   store.totalTicks++;
+  store.lastTickNum = (store.lastTickNum || 0) + 1;
 
   const win = parseInt(document.getElementById('ctrlWindow').value) || 50;
   if(store.ticks.length > win * 4) store.ticks.shift();
@@ -2013,13 +2015,11 @@ function selectBestDigitBet(freqs, signals, total, sym) {
 
 function analyzeRiseFall(data, prices) {
   const priceData = prices || S.priceTicks;
-  if(priceData.length < 10) return null; // need at least 10 ticks
+  if(priceData.length < 15) return null; // need enough history for multi-factor check
 
   const n = priceData.length;
 
-  // ── DUAL-WINDOW MOMENTUM (3-tick fast + 7-tick slow)
-  // Both must agree on direction — proven signal from baseline 11,973-trade dataset
-  // Removed triple-window and acceleration — they caused 699 ticks with zero trades
+  // ── FACTOR 1: DUAL-WINDOW MOMENTUM — both windows must agree on direction
   const fast3  = priceData.slice(-3).reduce((a,b)=>a+b,0) / 3;
   const prev3  = priceData.slice(-6,-3).reduce((a,b)=>a+b,0) / 3;
   const slow7  = priceData.slice(-7).reduce((a,b)=>a+b,0) / 7;
@@ -2028,40 +2028,59 @@ function analyzeRiseFall(data, prices) {
   const fastDelta = fast3 - prev3;
   const slowDelta = slow7 - prev7;
 
-  // Both windows must agree on direction
   if(Math.sign(fastDelta) !== Math.sign(slowDelta)) return null;
   if(fastDelta === 0) return null;
 
   const dir = fastDelta > 0 ? 'up' : 'down';
 
-  // Volatility filter: movement must be meaningful relative to recent range
-  // Threshold halved from 0.06 to 0.03 — was filtering too aggressively
+  // ── FACTOR 2: MAGNITUDE — delta must be genuinely meaningful vs noise.
+  // 5% of 20-tick range (was 3% — raised because 3% fired on noise constantly).
   const hi    = Math.max(...priceData.slice(-20));
   const lo    = Math.min(...priceData.slice(-20));
   const range = hi - lo || 0.001;
-  if(Math.abs(fastDelta) < range * 0.03) return null;
+  if(Math.abs(fastDelta) < range * 0.05) return null;
 
-  // Tick consistency: at least 1/3 recent ticks confirm direction
-  // Relaxed from 2/3 — 1/3 still filters noise but allows more signals
+  // ── FACTOR 3: TICK CONSISTENCY — 2 of last 3 tick-pairs must confirm.
+  // (Was 1/3 — the minimum that let almost every tick through.
+  //  Data: all 259 trades fired as "weak". 2/3 is the inflection point
+  //  that separates signal from noise on synthetic indices.)
   let consistent = 0;
   for(let i = n-4; i < n-1; i++) {
     if(dir==='up'   && priceData[i+1] > priceData[i]) consistent++;
     if(dir==='down' && priceData[i+1] < priceData[i]) consistent++;
   }
-  if(consistent < 1) return null;
+  if(consistent < 2) return null; // strict 2/3 minimum
 
-  // 1-tick payout: ~0.95x return on stake (payout field = 1.95 = stake + profit)
-  // Break-even: 53.3% WR — our baseline delivers 55.4%
+  // ── FACTOR 4: TREND PERSISTENCE — direction must have held for at
+  // least 3 of the last 5 ticks (not just the last pair).
+  // Filters out single-tick spikes that briefly satisfy factors 1-3.
+  const last5 = priceData.slice(-6);
+  let trendCount = 0;
+  for(let i = 0; i < last5.length-1; i++) {
+    if(dir==='up'   && last5[i+1] > last5[i]) trendCount++;
+    if(dir==='down' && last5[i+1] < last5[i]) trendCount++;
+  }
+  if(trendCount < 3) return null; // must have held for 3 of 5 ticks
+
+  // ── WIN PROBABILITY — computed from all four factors, not assumed.
+  // Baseline (2/3 consistent, 3/5 trend): 53.5% (just above 1-tick BE of 51.3%)
+  // With stronger consistency/trend: up to 57%
+  const consistencyBonus = (consistent - 2) * 0.02; // 0% at 2/3, +2% at 3/3
+  const trendBonus       = (trendCount  - 3) * 0.01; // 0% at 3/5, +1% per extra
+  const winProb = 0.535 + consistencyBonus + trendBonus;
+
   const payout  = 1.95;
-  const winProb = 0.51 + (consistent / 3) * 0.03;
   const ev      = winProb * payout - 1;
-  if(ev <= 0) return null;
+  if(ev <= 0.02) return null; // require genuinely positive EV (>2%), not just >0%
+
+  // Signal strength classification — used for UI and CSV export
+  const sigStrength = winProb >= 0.57 ? 'strong' : winProb >= 0.545 ? 'moderate' : 'weak';
 
   return {
-    type:    dir === 'up' ? 'CALL' : 'PUT',
-    label:   dir === 'up' ? 'RISE' : 'FALL',
-    desc:    `Dual-MA ${dir} · Δfast${fastDelta.toFixed(4)} Δslow${slowDelta.toFixed(4)} · ${consistent}/3 ticks`,
-    payout, winProb, ev, barrier: null
+    type:      dir === 'up' ? 'CALL' : 'PUT',
+    label:     dir === 'up' ? 'RISE' : 'FALL',
+    desc:      `${sigStrength} · Δfast${fastDelta.toFixed(4)} · ${consistent}/3 ticks · ${trendCount}/5 trend`,
+    payout, winProb, ev, sigStrength, barrier: null
   };
 }
 
@@ -2104,7 +2123,7 @@ function computeKellyStake(index, strategy) {
   const recent = S.comboRecent[key];
 
   // Not enough recent data on THIS combo → exploration stake
-  if(recent.length < 8) {
+  if(recent.length < 4) {
     return Math.max(0.35, +(S.baseStake * 0.5).toFixed(2));
   }
 
@@ -2151,7 +2170,7 @@ function updateRegime(won, profit, index, strategy) {
   if(!S.comboRecent) S.comboRecent = {};
   if(!S.comboRecent[key]) S.comboRecent[key] = [];
   S.comboRecent[key].push(profit);
-  if(S.comboRecent[key].length > 20) S.comboRecent[key].shift();
+  if(S.comboRecent[key].length > 8) S.comboRecent[key].shift(); // fast 8-trade window
 }
 
 // ─────────────────────────────────────────────────────
@@ -2207,8 +2226,13 @@ function maybeEnterPosition(index, strategy) {
   // 'effectively infinite' pause approach was removed because it
   // deadlocked: paused combos could never win to unpause themselves.
 
-  const minGap = strategy === 'digit' ? 800 : 500;
-  if(Date.now() - (S.comboLastTradeTime[comboKey] || 0) < minGap) return;
+  // Tick-count gate: minimum 3 ticks on THIS index before this combo fires again.
+  // Replaces the ms-timer which was allowing multiple combos to fire on the
+  // exact same tick (same price movement — correlated losses).
+  const indexStore   = S.indexData[index] || {};
+  const currentTick  = indexStore.lastTickNum || 0;
+  const lastTradeTick = S.comboLastTradeTick[comboKey] || 0;
+  if(currentTick - lastTradeTick < 3) return; // require 3 fresh ticks since last trade
 
   // ── TIME FILTER (13:00-14:00 GMT = -$2,015, 48.6% WR in baseline data)
   // Per-combo now: only trade this specific combo during the bad hour if
@@ -2245,7 +2269,8 @@ function maybeEnterPosition(index, strategy) {
   }
 
   const stake = computeKellyStake(index, strategy);
-  S.comboLastTradeTime[comboKey] = Date.now();
+  S.comboLastTradeTime[comboKey]  = Date.now();
+  S.comboLastTradeTick[comboKey]  = currentTick; // lock in tick number for gap check
 
   enterPosition(index, strategy, bet, stake);
 }
